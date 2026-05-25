@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated review/cleaning output. Never commit cleaned product images.
+outputs/
+tmp-*/
+tmp_*/
+
+# Local virtual environments
+.venv/
+venv/
+
