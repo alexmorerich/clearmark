@@ -63,20 +63,21 @@ PRESETS = {
     },
 }
 
-MAX_MASK_AREA = 0.06
-PILOT_MASK_AREA = 0.045
+MAX_MASK_AREA = 0.03
+PILOT_MASK_AREA = 0.022
 INPAINT_RADIUS = 5
 SHARPNESS_MIN_RATIO = 0.30
 TEXT_LIKENESS_MIN = 0.12
 CLEAN_VISIBLE_RESIDUAL_MAX = 0.48
 ARTIFACT_SHARPNESS_REVIEW_RATIO = 0.18
-COMBINED_MASK_REVIEW_AREA = 0.08
+COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
 REVIEW_CONTRAST_SPAN = 170.0
 FALLBACK_CONTRAST_SPAN = 150.0
 LINE_DOMINANCE_MAX = 0.72
 OCR_WATERMARK_RE = re.compile(r"(sunsky|sky.*onlin|onlin.*com|onlinecom|olne.*com|alinec)")
+_CANONICAL_INK_MASK: np.ndarray | None = None
 
 
 @dataclass
@@ -115,6 +116,15 @@ class Detection:
             "line_dominance": round(self.line_dominance, 3),
             "confidence": round(self.confidence, 4),
         }
+
+
+@dataclass(frozen=True)
+class TemplateSpec:
+    name: str
+    image: np.ndarray
+    kind: str
+    start: float = 0.0
+    end: float = 1.0
 
 
 def now_run_id(prefix: str) -> str:
@@ -276,10 +286,24 @@ def crop_template_to_ink(gray: np.ndarray, margin: int = 3) -> np.ndarray:
     return gray[y1:y2, x1:x2]
 
 
-def derived_text_templates(name: str, gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def canonical_ink_mask() -> np.ndarray:
+    global _CANONICAL_INK_MASK
+    if _CANONICAL_INK_MASK is not None:
+        return _CANONICAL_INK_MASK
+    tpl = cv2.imread(str(TEMPLATE_DIR / "watermark-template.png"), cv2.IMREAD_GRAYSCALE)
+    if tpl is None:
+        raise SystemExit(f"Missing canonical watermark template: {TEMPLATE_DIR / 'watermark-template.png'}")
+    cropped = crop_template_to_ink(tpl, margin=1)
+    blur = cv2.GaussianBlur(cropped, (3, 3), 0)
+    _, ink = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _CANONICAL_INK_MASK = ink
+    return ink
+
+
+def derived_text_templates(name: str, gray: np.ndarray) -> list[TemplateSpec]:
     """Build a small set of exact-domain text crops from a full watermark template."""
     base = crop_template_to_ink(gray)
-    variants = [(name, base)]
+    variants = [TemplateSpec(name=name, image=base, kind="full", start=0.0, end=1.0)]
     width = base.shape[1]
     if width >= 120:
         for suffix, start, end in (
@@ -291,12 +315,18 @@ def derived_text_templates(name: str, gray: np.ndarray) -> list[tuple[str, np.nd
             x2 = int(round(width * end))
             crop = base[:, x1:x2]
             if crop.shape[1] >= 60:
-                variants.append((f"{name}:{suffix}", crop))
+                variants.append(TemplateSpec(
+                    name=f"{name}:{suffix}",
+                    image=crop,
+                    kind="crop",
+                    start=start,
+                    end=end,
+                ))
     return variants
 
 
-def load_templates() -> list[tuple[str, np.ndarray]]:
-    templates: list[tuple[str, np.ndarray]] = []
+def load_templates() -> list[TemplateSpec]:
+    templates: list[TemplateSpec] = []
     fallback_templates: list[tuple[str, np.ndarray]] = []
     for p in sorted(TEMPLATE_DIR.glob("*.png")):
         img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
@@ -308,9 +338,14 @@ def load_templates() -> list[tuple[str, np.ndarray]]:
                 fallback_templates.append((p.name, img))
     if not templates:
         raise SystemExit(f"No text-like watermark templates found in {TEMPLATE_DIR}")
-    # Thin real-image strips are useful for faint watermarks, but too generic to
-    # drive detection alone without the downstream plausibility gate.
-    templates.extend(fallback_templates)
+    # Real-image strips are too generic for primary detection: in pilots they
+    # matched screws, flex-cable traces, phone-frame edges, and shadows. Keep
+    # the canonical text templates as the only signal that can trigger masking.
+    if fallback_templates:
+        print(
+            f"  ignored {len(fallback_templates)} non-text fallback template(s) for detection",
+            file=sys.stderr,
+        )
     return templates
 
 
@@ -330,6 +365,24 @@ def refined_mark_box(raw: dict, img_w: int, img_h: int) -> dict:
     mark_w = max(raw["w"] * 1.18, mark_h * 6.8)
     mark_w = min(mark_w, img_w * 0.42)
     return clamp_box(cx - mark_w / 2, cy - mark_h / 2, mark_w, mark_h, img_w, img_h)
+
+
+def project_mark_box(raw: dict, template: TemplateSpec, img_w: int, img_h: int) -> dict:
+    """Project a template hit back to the full sunsky-online.com text band.
+
+    Partial crops such as right70 match only one side of the text. Centering a
+    mask on that partial hit misses the real watermark position. Projection uses
+    the crop offset inside the canonical full text to recover the full band.
+    """
+    span = max(0.15, template.end - template.start)
+    full_w = raw["w"] / span
+    x = raw["x"] - full_w * template.start
+    y = raw["y"]
+    pad_x = max(3.0, full_w * 0.035)
+    pad_y = max(3.0, raw["h"] * 0.24)
+    mark_w = min(full_w + 2 * pad_x, img_w * 0.46)
+    mark_h = min(raw["h"] + 2 * pad_y, img_h * 0.070)
+    return clamp_box(x - pad_x, y - pad_y, mark_w, mark_h, img_w, img_h)
 
 
 def text_likeness(gray: np.ndarray, box: dict) -> tuple[float, int]:
@@ -479,9 +532,13 @@ def plausible_candidate(
     return confidence >= 0.52
 
 
-def verify_candidate(gray: np.ndarray, raw: dict, templates: list[tuple[str, np.ndarray]]) -> float:
+def full_text_templates(templates: list[TemplateSpec]) -> list[TemplateSpec]:
+    full = [tpl for tpl in templates if tpl.kind == "full"]
+    return full or templates
+
+
+def verify_candidate(gray: np.ndarray, box: dict, templates: list[TemplateSpec]) -> float:
     img_h, img_w = gray.shape[:2]
-    box = refined_mark_box(raw, img_w, img_h)
     pad_x = max(12, box["w"] // 8)
     pad_y = max(8, box["h"] // 2)
     x1 = max(0, box["x"] - pad_x)
@@ -493,10 +550,11 @@ def verify_candidate(gray: np.ndarray, raw: dict, templates: list[tuple[str, np.
         return 0.0
 
     best = 0.0
-    target_h = max(raw["h"], 6)
-    for _, tpl in templates:
+    target_h = max(int(round(box["h"] / 1.48)), 6)
+    for spec in full_text_templates(templates):
+        tpl = spec.image
         th, tw = tpl.shape[:2]
-        for factor in (0.75, 0.9, 1.0, 1.15, 1.3):
+        for factor in (0.82, 0.94, 1.0, 1.08, 1.20):
             scale = (target_h / max(th, 1)) * factor
             sw, sh = int(tw * scale), int(th * scale)
             if sw < 24 or sh < 6 or sw >= roi.shape[1] or sh >= roi.shape[0]:
@@ -511,6 +569,8 @@ def verify_candidate(gray: np.ndarray, raw: dict, templates: list[tuple[str, np.
 
 
 def detection_rank(det: Detection, img_w: int, img_h: int) -> float:
+    if det.template.startswith("ocr:"):
+        return 10.0 + det.confidence + det.verify_score
     b = det.mark_box
     cx = b["x"] + b["w"] / 2
     cy = b["y"] + b["h"] / 2
@@ -523,11 +583,14 @@ def detection_rank(det: Detection, img_w: int, img_h: int) -> float:
     text_bonus = min(0.7, det.text_score * 0.7)
     contrast_penalty = 0.28 if det.contrast_span > REVIEW_CONTRAST_SPAN else 0.0
     line_penalty = 0.22 if det.line_dominance > LINE_DOMINANCE_MAX else 0.0
-    return (
+    rank = (
         det.score + det.verify_score + det.confidence + aspect_bonus + text_bonus
         - edge_penalty - extreme_y_penalty - center_penalty - area_penalty
         - contrast_penalty - line_penalty
     )
+    if det.template.startswith("prior:"):
+        rank -= 0.75
+    return rank
 
 
 def nms(detections: list[Detection], img_w: int, img_h: int, limit: int) -> list[Detection]:
@@ -628,9 +691,86 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
     return detections
 
 
+def prior_text_band_detections(gray: np.ndarray, img: np.ndarray | None = None) -> list[Detection]:
+    """Find faint center-body text bands when template correlation is weak.
+
+    Sunsky marks are low-contrast horizontal text, usually placed in the image
+    body. Product edges that fooled template matching tend to have much higher
+    local contrast. This pass deliberately ignores high-contrast texture.
+    """
+    img_h, img_w = gray.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV) if img is not None else None
+    detections: list[Detection] = []
+    width_fracs = (0.22, 0.28, 0.34, 0.40)
+    x_fracs = (0.20, 0.28, 0.36, 0.44)
+    y_fracs = (0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78)
+    for wf in width_fracs:
+        bw = int(round(img_w * wf))
+        if bw < 90:
+            continue
+        for aspect in (7.2, 8.4, 9.4):
+            bh = int(round(max(14, bw / aspect)))
+            if bh < 12 or bh > img_h * 0.075:
+                continue
+            for xf in x_fracs:
+                x = int(round(img_w * xf))
+                if x + bw > img_w:
+                    continue
+                for yf in y_fracs:
+                    y = int(round(img_h * yf - bh / 2))
+                    box = clamp_box(x, y, bw, bh, img_w, img_h)
+                    text_score, text_components = text_likeness(gray, box)
+                    if text_score < 0.78 or text_components < 10:
+                        continue
+                    features = band_features(gray, box)
+                    contrast_span = features["contrast_span"]
+                    line_dominance = features["line_dominance"]
+                    if contrast_span > 95.0 or line_dominance > 0.48:
+                        continue
+                    if hsv is not None:
+                        sat_roi = hsv[
+                            box["y"]:box["y"] + box["h"],
+                            box["x"]:box["x"] + box["w"],
+                            1,
+                        ]
+                        if float(np.mean(sat_roi > 58)) > 0.20:
+                            continue
+                    area_pct = 100.0 * box["w"] * box["h"] / max(1, img_w * img_h)
+                    if area_pct > 100 * MAX_MASK_AREA:
+                        continue
+                    cx = box["x"] + box["w"] / 2
+                    cy = box["y"] + box["h"] / 2
+                    center_bias = 1.0 - min(1.0, (
+                        abs(cx - img_w * 0.50) / max(img_w * 0.50, 1)
+                        + abs(cy - img_h * 0.54) / max(img_h * 0.54, 1)
+                    ) / 2)
+                    contrast_bonus = max(0.0, 1.0 - contrast_span / 95.0)
+                    confidence = (
+                        text_score * 0.52
+                        + min(1.0, text_components / 22.0) * 0.18
+                        + center_bias * 0.18
+                        + contrast_bonus * 0.12
+                    )
+                    detections.append(Detection(
+                        x=box["x"], y=box["y"], w=box["w"], h=box["h"],
+                        score=float(confidence),
+                        verify_score=max(0.44, contrast_bonus * 0.36 + center_bias * 0.24),
+                        template="prior:text_band",
+                        scale=1.0,
+                        mark_box=box,
+                        mask_area_pct=area_pct,
+                        text_score=text_score,
+                        text_components=text_components,
+                        contrast_span=contrast_span,
+                        line_dominance=line_dominance,
+                        confidence=float(min(0.88, confidence)),
+                    ))
+    return detections
+
+
 def detect_watermark(
     gray: np.ndarray,
-    templates: list[tuple[str, np.ndarray]],
+    templates: list[TemplateSpec],
     preset_name: str,
     img: np.ndarray | None = None,
     ocr_reader=None,
@@ -648,7 +788,10 @@ def detect_watermark(
     found: list[Detection] = []
     if img is not None and ocr_reader is not None:
         found.extend(ocr_watermark_detections(img, gray, ocr_reader))
-    for tpl_name, tpl in templates:
+    found.extend(prior_text_band_detections(gray, img=img))
+    for spec in templates:
+        tpl_name = spec.name
+        tpl = spec.image
         th, tw = tpl.shape[:2]
         for scale in preset["scales"]:
             sw, sh = int(tw * scale), int(th * scale)
@@ -672,12 +815,12 @@ def detect_watermark(
                     "w": int(round(sw * scale_back)),
                     "h": int(round(sh * scale_back)),
                 }
-                verify = verify_candidate(gray, raw, templates)
-                if verify < preset["verify_min"]:
-                    continue
-                mark = refined_mark_box(raw, img_w, img_h)
+                mark = project_mark_box(raw, spec, img_w, img_h)
                 area_pct = 100.0 * mark["w"] * mark["h"] / max(1, img_w * img_h)
                 if area_pct > 100 * MAX_MASK_AREA:
+                    continue
+                verify = verify_candidate(gray, mark, templates)
+                if verify < preset["verify_min"]:
                     continue
                 text_score, text_components = text_likeness(gray, mark)
                 features = band_features(gray, mark)
@@ -718,6 +861,7 @@ def detect_watermark(
 def create_mask(
     gray: np.ndarray,
     det: Detection,
+    img: np.ndarray | None = None,
     pad_x: int = 8,
     pad_y: int = 5,
     dilate_px: int = 4,
@@ -731,26 +875,44 @@ def create_mask(
     y2 = min(img_h, b["y"] + b["h"] + pad_y)
     mask = np.zeros((img_h, img_w), dtype=np.uint8)
     if glyph:
-        roi = gray[y1:y2, x1:x2]
-        kernel = max(5, min(35, (max(3, b["h"]) // 2) * 2 + 1))
-        background = cv2.medianBlur(roi, kernel)
-        dev = cv2.absdiff(roi, background)
-        threshold = max(3, float(np.percentile(dev, 76)))
-        glyph_mask = (dev >= threshold).astype(np.uint8) * 255
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(glyph_mask, 8)
-        filtered = np.zeros_like(glyph_mask)
-        for idx in range(1, count):
-            _, _, ww, hh, area = stats[idx]
-            if area < 2 or area > roi.size * 0.20:
-                continue
-            if hh < 2 or hh > roi.shape[0] * 0.95:
-                continue
-            if ww > roi.shape[1] * 0.55:
-                continue
-            filtered[labels == idx] = 255
-        if np.count_nonzero(filtered) < max(20, int(roi.size * 0.01)):
-            return None, 0.0
-        mask[y1:y2, x1:x2] = filtered
+        if det.template.startswith("ocr:"):
+            ink = canonical_ink_mask()
+            ih, iw = ink.shape[:2]
+            target_w = max(24, int(round(b["w"] * 0.94)))
+            target_h = max(8, int(round(target_w * ih / max(iw, 1))))
+            if target_h > b["h"] * 0.72:
+                target_h = max(8, int(round(b["h"] * 0.72)))
+                target_w = max(24, int(round(target_h * iw / max(ih, 1))))
+            target_w = min(target_w, img_w)
+            target_h = min(target_h, img_h)
+            resized = cv2.resize(ink, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            _, resized = cv2.threshold(resized, 20, 255, cv2.THRESH_BINARY)
+            tx = int(round(b["x"] + (b["w"] - target_w) / 2))
+            ty = int(round(b["y"] + (b["h"] - target_h) / 2))
+            tx = max(0, min(tx, img_w - target_w))
+            ty = max(0, min(ty, img_h - target_h))
+            mask[ty:ty + target_h, tx:tx + target_w] = resized
+        else:
+            roi = gray[y1:y2, x1:x2]
+            kernel = max(5, min(35, (max(3, b["h"]) // 2) * 2 + 1))
+            background = cv2.medianBlur(roi, kernel)
+            dev = cv2.absdiff(roi, background)
+            threshold = max(3, float(np.percentile(dev, 76)))
+            glyph_mask = (dev >= threshold).astype(np.uint8) * 255
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(glyph_mask, 8)
+            filtered = np.zeros_like(glyph_mask)
+            for idx in range(1, count):
+                _, _, ww, hh, area = stats[idx]
+                if area < 2 or area > roi.size * 0.20:
+                    continue
+                if hh < 2 or hh > roi.shape[0] * 0.95:
+                    continue
+                if ww > roi.shape[1] * 0.55:
+                    continue
+                filtered[labels == idx] = 255
+            if np.count_nonzero(filtered) < max(20, int(roi.size * 0.01)):
+                return None, 0.0
+            mask[y1:y2, x1:x2] = filtered
     else:
         mask[y1:y2, x1:x2] = 255
     if dilate_px:
@@ -762,10 +924,9 @@ def create_mask(
     return mask, area
 
 
-def residual_score(gray: np.ndarray, det: Detection, templates: list[tuple[str, np.ndarray]] | None = None) -> float:
+def residual_score(gray: np.ndarray, det: Detection, templates: list[TemplateSpec] | None = None) -> float:
     templates = templates or load_templates()
-    raw = {"x": det.x, "y": det.y, "w": det.w, "h": det.h}
-    return verify_candidate(gray, raw, templates)
+    return verify_candidate(gray, det.mark_box, templates)
 
 
 def residual_visibility_score(
@@ -795,7 +956,7 @@ def residual_visibility_score(
 def residual_quality_metrics(
     gray: np.ndarray,
     det: Detection,
-    templates: list[tuple[str, np.ndarray]] | None = None,
+    templates: list[TemplateSpec] | None = None,
 ) -> dict:
     template_residual = residual_score(gray, det, templates)
     post_text_score, post_text_components = text_likeness(gray, det.mark_box)
@@ -828,16 +989,14 @@ def clean_image(
     img: np.ndarray,
     gray: np.ndarray,
     det: Detection,
-    templates: list[tuple[str, np.ndarray]] | None = None,
+    templates: list[TemplateSpec] | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
     variants = [
         ("glyph_tight", 8, 5, 3, 3, True),
         ("glyph_medium", 12, 7, 4, 4, True),
+        ("glyph_strong", 14, 8, 6, 7, True),
         ("tight", 8, 5, 4, 4, False),
         ("medium", 12, 7, 5, 5, False),
-        ("wide", 18, 9, 6, 7, False),
-        ("wider", 28, 14, 8, 9, False),
-        ("fullband", 36, 18, 10, 11, False),
     ]
     before = laplacian_var(gray)
     candidates = []
@@ -845,7 +1004,7 @@ def clean_image(
     first_area = 0.0
 
     for variant, pad_x, pad_y, dilate_px, radius, glyph in variants:
-        mask, area = create_mask(gray, det, pad_x=pad_x, pad_y=pad_y, dilate_px=dilate_px, glyph=glyph)
+        mask, area = create_mask(gray, det, img=img, pad_x=pad_x, pad_y=pad_y, dilate_px=dilate_px, glyph=glyph)
         if mask is None:
             continue
         if first_mask is None:
@@ -864,7 +1023,7 @@ def clean_image(
             cost = (
                 min(1.0, residual)
                 + min(1.0, template_residual) * 0.18
-                + area * 0.35
+                + area * 10.0
                 + artifact_penalty
             )
             score = -cost
@@ -900,7 +1059,13 @@ def clean_image(
             "post_text_score": round(metrics["post_text_score"], 4),
             "post_text_components": metrics["post_text_components"],
         }
-    status = "cleaned" if residual < CLEAN_VISIBLE_RESIDUAL_MAX else "needs_manual"
+    broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
+    position_confident = not det.template.startswith("prior:")
+    status = (
+        "cleaned"
+        if residual < CLEAN_VISIBLE_RESIDUAL_MAX and not broad_mask and ratio >= 0.30 and position_confident
+        else "needs_manual"
+    )
     meta = {
         "status": status,
         "strategy": name,
@@ -912,7 +1077,14 @@ def clean_image(
         "post_text_components": metrics["post_text_components"],
     }
     if status == "needs_manual":
-        meta["reason"] = "residual_visible_or_wrong_detection"
+        if broad_mask:
+            meta["reason"] = "mask_area_review"
+        elif not position_confident:
+            meta["reason"] = "low_position_confidence"
+        elif ratio < 0.30:
+            meta["reason"] = "blurry"
+        else:
+            meta["reason"] = "residual_visible_or_wrong_detection"
     if (
         ratio < ARTIFACT_SHARPNESS_REVIEW_RATIO
         and status == "cleaned"
@@ -932,7 +1104,7 @@ def clean_all_detections(
     img: np.ndarray,
     gray: np.ndarray,
     detections: list[Detection],
-    templates: list[tuple[str, np.ndarray]] | None = None,
+    templates: list[TemplateSpec] | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
     current = img.copy()
     combined_mask = np.zeros(gray.shape[:2], dtype=np.uint8)
@@ -1010,9 +1182,10 @@ def cleaning_targets(detections: list[Detection]) -> list[Detection]:
     if not detections:
         return []
     targets = [detections[0]]
+    if not detections[0].template.startswith("ocr:"):
+        return targets
     for det in detections[1:]:
-        text_template = det.template.startswith("ocr:") or det.template.startswith("watermark-template")
-        if text_template and det.confidence >= 0.60:
+        if det.template.startswith("ocr:") and det.confidence >= 0.60:
             targets.append(det)
         if len(targets) >= 4:
             break
@@ -1161,7 +1334,7 @@ def choose_pilot_files(inventory: list[dict], max_total: int, seed: int) -> list
 
 def process_file(
     path: Path,
-    templates: list[tuple[str, np.ndarray]],
+    templates: list[TemplateSpec],
     preset: str,
     out_dir: Path,
     review: bool,
@@ -1378,7 +1551,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preset", choices=sorted(PRESETS), default="review")
     p.add_argument("--max-total", type=int, default=50)
     p.add_argument("--seed", type=int, default=1779606245)
-    p.add_argument("--ocr", action="store_true", help="Use optional EasyOCR text confirmation during the pilot.")
+    p.add_argument(
+        "--ocr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use EasyOCR text confirmation during the pilot. Enabled by default; pass --no-ocr for faster heuristic-only QA.",
+    )
     p.add_argument("--rights-confirmed", action="store_true")
     p.set_defaults(func=cmd_pilot)
 

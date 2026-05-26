@@ -33,7 +33,9 @@ python3 scripts/watermark_pipeline.py inventory \
   --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets
 ```
 
-Run a small QA pilot with original / mask / cleaned preview HTML:
+Run a small QA pilot with original / mask / cleaned preview HTML.
+Pilot mode uses OCR by default for higher watermark-position accuracy. Pass
+`--no-ocr` only for a faster heuristic-only check.
 
 ```bash
 cd /Users/alexkou/Documents/openai/clearmark
@@ -41,7 +43,25 @@ python3 scripts/watermark_pipeline.py pilot \
   --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
   --max-total 50 \
   --preset review \
+  --out /Users/alexkou/Documents/openai/clearmark/outputs/pilot-test-50 \
   --rights-confirmed
+```
+
+Output images for this test are written here:
+
+```text
+/Users/alexkou/Documents/openai/clearmark/outputs/pilot-test-50/
+  originals/   copied source images for review only
+  overlays/    original images with red mask overlay
+  masks/       black/white mask images
+  cleaned/     cleaned image copies when auto-clean passed QA
+  review.html  side-by-side original / mask overlay / result review page
+```
+
+Open this file after the pilot finishes:
+
+```text
+/Users/alexkou/Documents/openai/clearmark/outputs/pilot-test-50/review.html
 ```
 
 Run the one-pass production workflow:
@@ -75,6 +95,7 @@ outputs/<run-id>/
   cleaned/          cleaned image copies
   masks/            black/white masks
   originals/        copied originals for pilot review only
+  overlays/         original images with red mask overlay
   failed/           optional review artifacts for needs_manual
   manifest.jsonl    one entry per source file
   summary.json      counts, settings, buckets, duplicate stats
@@ -83,4 +104,8 @@ outputs/<run-id>/
 
 ## Notes
 
-The pipeline uses OpenCV template matching first. It intentionally avoids MSER by default because MSER caused false positives on screws, connectors, and other small metal parts. Perceptual hashing is implemented locally with OpenCV DCT, so no `imagehash` package is required.
+The pilot pipeline uses OCR confirmation first, then conservative text-template
+and low-contrast text-band fallbacks. Non-text real-image strips are not allowed
+to trigger masking because they caused false positives on screws, connectors,
+and other small metal parts. Perceptual hashing is implemented locally with
+OpenCV DCT, so no `imagehash` package is required.
