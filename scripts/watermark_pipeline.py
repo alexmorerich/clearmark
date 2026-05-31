@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -1622,6 +1623,177 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
     (out_dir / "review.html").write_text(doc)
 
 
+def _load_pdf_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _pdf_safe_image(path: Path, max_size: tuple[int, int]):
+    from PIL import Image, ImageDraw
+
+    try:
+        img = Image.open(path).convert("RGB")
+    except Exception:
+        img = Image.new("RGB", max_size, "white")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0, 0, max_size[0] - 1, max_size[1] - 1], outline="#cbd5e1")
+        draw.text((18, 18), "missing image", fill="#64748b", font=_load_pdf_font(18))
+        return img
+    img.thumbnail(max_size, Image.Resampling.LANCZOS)
+    return img
+
+
+def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
+    """Create a compact visual review PDF from the same assets as review.html."""
+    from PIL import Image, ImageDraw
+
+    pdf_path = out_dir / "compare.pdf"
+    title_font = _load_pdf_font(26, bold=True)
+    meta_font = _load_pdf_font(18)
+    label_font = _load_pdf_font(20, bold=True)
+    small_font = _load_pdf_font(15)
+    page_size = (1680, 1080)
+    margin = 36
+    gap = 18
+    header_h = 100
+    label_h = 34
+    col_w = (page_size[0] - margin * 2 - gap * 3) // 4
+    img_h = page_size[1] - margin * 2 - header_h - label_h
+    panes = [
+        ("Original", "review_original"),
+        ("Mask overlay", "review_mask"),
+        ("Result", "review_cleaned"),
+        ("Diff x3", "review_diff"),
+    ]
+    pages = []
+    pdf_rows = rows or [{"file": "no rows", "status": "empty"}]
+    for idx, row in enumerate(pdf_rows, 1):
+        page = Image.new("RGB", page_size, "white")
+        draw = ImageDraw.Draw(page)
+        filename = str(row.get("file", ""))
+        status = str(row.get("status", ""))
+        strategy = str(row.get("strategy") or row.get("reason") or "")
+        metrics = []
+        for key, label in [
+            ("mask_area_pct", "mask"),
+            ("residual_score", "visible"),
+            ("template_residual_score", "template"),
+            ("post_text_components", "components"),
+        ]:
+            if key in row:
+                metrics.append(f"{label} {row.get(key)}")
+        draw.text((margin, 24), f"#{idx} {filename}", fill="#111827", font=title_font)
+        draw.text(
+            (margin, 60),
+            " | ".join(part for part in [status, strategy, *metrics] if part),
+            fill="#475569",
+            font=meta_font,
+        )
+
+        for col, (label, rel_key) in enumerate(panes):
+            x = margin + col * (col_w + gap)
+            y = margin + header_h
+            rel_path = row.get(rel_key)
+            img_path = out_dir / rel_path if rel_path else Path()
+            img = _pdf_safe_image(img_path, (col_w, img_h))
+            box = [x, y, x + col_w, y + img_h]
+            draw.rectangle(box, outline="#d8dee8", width=2)
+            px = x + (col_w - img.width) // 2
+            py = y + (img_h - img.height) // 2
+            page.paste(img, (px, py))
+            draw.rectangle([x, y + img_h, x + col_w, y + img_h + label_h], fill="#f8fafc", outline="#d8dee8")
+            draw.text((x + 12, y + img_h + 7), label, fill="#334155", font=label_font)
+        draw.text(
+            (margin, page_size[1] - 24),
+            f"Clearmark visual review PDF: {out_dir}",
+            fill="#64748b",
+            font=small_font,
+        )
+        pages.append(page)
+
+    pages[0].save(pdf_path, "PDF", save_all=True, append_images=pages[1:], resolution=120.0, quality=90)
+    return pdf_path
+
+
+def send_telegram_document(
+    document_path: Path,
+    caption: str,
+    token_env: str,
+    chat_id_env: str,
+    chat_id_arg: str | None = None,
+) -> dict:
+    token = os.environ.get(token_env)
+    chat_id = chat_id_arg or os.environ.get(chat_id_env)
+    if not token or not chat_id:
+        return {
+            "sent": False,
+            "reason": "missing_telegram_env",
+            "token_env": token_env,
+            "chat_id_env": chat_id_env,
+        }
+
+    import urllib.error
+    import urllib.request
+
+    boundary = f"----clearmark-{uuid.uuid4().hex}"
+    body = bytearray()
+
+    def add_field(name: str, value: str) -> None:
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(value.encode("utf-8"))
+        body.extend(b"\r\n")
+
+    def add_file(name: str, path: Path, content_type: str) -> None:
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'.encode()
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
+        body.extend(path.read_bytes())
+        body.extend(b"\r\n")
+
+    add_field("chat_id", chat_id)
+    add_field("caption", caption[:1024])
+    add_file("document", document_path, "application/pdf")
+    body.extend(f"--{boundary}--\r\n".encode())
+
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendDocument",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        payload = exc.read().decode("utf-8", errors="replace")
+        return {"sent": False, "reason": f"http_{exc.code}", "response": payload[:600]}
+    except Exception as exc:
+        return {"sent": False, "reason": type(exc).__name__}
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return {"sent": False, "reason": "invalid_json", "response": payload[:600]}
+    if not parsed.get("ok"):
+        return {"sent": False, "reason": "telegram_rejected", "response": parsed}
+    result = parsed.get("result", {})
+    return {"sent": True, "message_id": result.get("message_id"), "chat_id": chat_id}
+
+
 def write_blank_mask(path: Path, source: np.ndarray) -> None:
     blank = np.zeros(source.shape[:2], dtype=np.uint8)
     copy_or_write_image(path, blank)
@@ -1803,19 +1975,29 @@ def cmd_inventory(args: argparse.Namespace) -> None:
 
 
 def cmd_pilot(args: argparse.Namespace) -> None:
+    global ENABLE_LAMA_ESCALATION
     require_rights(args)
+    ENABLE_LAMA_ESCALATION = bool(args.lama)
     assets = args.assets.expanduser().resolve()
     out_dir = prepare_out_dir(args.out, "pilot")
     inventory, summary = build_inventory(assets, out_dir, args.phash_threshold)
-    sample = choose_pilot_files(inventory, args.max_total, args.seed)
+    scan_limit = args.max_scan or (args.max_total * 8 if args.watermarked_only else args.max_total)
+    sample = choose_pilot_files(inventory, scan_limit, args.seed)
     templates = load_templates()
     ocr_reader = load_ocr_reader(args.ocr)
     rows = []
+    skipped_no_watermark = 0
     started = time.time()
     for idx, fname in enumerate(sample, 1):
         row = process_file(assets / fname, templates, args.preset, out_dir, review=True, ocr_reader=ocr_reader)
+        if args.watermarked_only and row["status"] == "no_watermark":
+            skipped_no_watermark += 1
+            print(f"  pilot scan {idx}/{len(sample)} selected {len(rows)}/{args.max_total} skip no_watermark {fname}")
+            continue
         rows.append(row)
-        print(f"  pilot {idx}/{len(sample)} {row['status']} {fname}")
+        print(f"  pilot {idx}/{len(sample)} selected {len(rows)}/{args.max_total} {row['status']} {fname}")
+        if args.watermarked_only and len(rows) >= args.max_total:
+            break
     make_review_html(out_dir, rows)
     with manifest_writer(out_dir / "manifest.jsonl") as fh:
         for row in rows:
@@ -1830,18 +2012,43 @@ def cmd_pilot(args: argparse.Namespace) -> None:
         "preset": args.preset,
         "ocr": bool(args.ocr),
         "seed": args.seed,
+        "watermarked_only": bool(args.watermarked_only),
+        "scan_limit": scan_limit,
+        "selected": len(rows),
+        "skipped_no_watermark_during_selection": skipped_no_watermark,
         "seconds": round(time.time() - started, 2),
         "inventory": summary["counts"],
         "counts": counts,
     }
+    pdf_path = None
+    if args.pdf or args.telegram:
+        pdf_path = make_compare_pdf(out_dir, rows)
+        final["compare_pdf"] = str(pdf_path)
+    if args.telegram:
+        if pdf_path is None:
+            pdf_path = make_compare_pdf(out_dir, rows)
+        caption = f"Clearmark Sunsky review: {len(rows)} files | {counts}"
+        final["telegram"] = send_telegram_document(
+            pdf_path,
+            caption,
+            args.telegram_token_env,
+            args.telegram_chat_id_env,
+            args.telegram_chat_id,
+        )
     (out_dir / "summary.json").write_text(json.dumps(final, indent=2))
     print(f"Pilot complete: {out_dir}")
     print(f"Review HTML: {out_dir / 'review.html'}")
+    if pdf_path is not None:
+        print(f"Compare PDF: {pdf_path}")
+    if args.telegram:
+        print(f"Telegram: {json.dumps(final['telegram'], indent=2)}")
     print(json.dumps(counts, indent=2))
 
 
 def cmd_process(args: argparse.Namespace) -> None:
+    global ENABLE_LAMA_ESCALATION
     require_rights(args)
+    ENABLE_LAMA_ESCALATION = bool(args.lama)
     assets = args.assets.expanduser().resolve()
     out_dir = prepare_out_dir(args.out, "process")
     inventory, summary = build_inventory(assets, out_dir, args.phash_threshold)
@@ -1942,7 +2149,15 @@ def build_parser() -> argparse.ArgumentParser:
     common(p)
     p.add_argument("--preset", choices=sorted(PRESETS), default="review")
     p.add_argument("--max-total", type=int, default=50)
+    p.add_argument("--max-scan", type=int, help="Maximum candidate files to inspect when --watermarked-only is enabled.")
     p.add_argument("--seed", type=int, default=1779606245)
+    p.add_argument("--watermarked-only", action="store_true", help="Keep scanning until the pilot has --max-total detected watermark cases.")
+    p.add_argument("--pdf", action="store_true", help="Write compare.pdf beside review.html.")
+    p.add_argument("--telegram", action="store_true", help="Send compare.pdf to Telegram after the pilot finishes.")
+    p.add_argument("--telegram-chat-id")
+    p.add_argument("--telegram-token-env", default="TELEGRAM_BOT_TOKEN")
+    p.add_argument("--telegram-chat-id-env", default="TELEGRAM_CHAT_ID")
+    p.add_argument("--lama", action=argparse.BooleanOptionalAction, default=True, help="Allow optional LaMa/IOPaint escalation for high-residual cases. Pass --no-lama for faster review sampling.")
     p.add_argument(
         "--ocr",
         action=argparse.BooleanOptionalAction,
@@ -1959,6 +2174,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int)
     p.add_argument("--progress-every", type=int, default=500)
     p.add_argument("--ocr", action="store_true", help="Use optional EasyOCR text confirmation. This is slower and best for QA runs.")
+    p.add_argument("--lama", action=argparse.BooleanOptionalAction, default=True, help="Allow optional LaMa/IOPaint escalation for high-residual cases.")
     p.add_argument("--rights-confirmed", action="store_true")
     p.set_defaults(func=cmd_process)
     return parser
