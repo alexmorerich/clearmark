@@ -64,6 +64,8 @@ strategy bank. The important ideas are:
 - confirm that the text is actually `sunsky-online.com`;
 - route repair by the pixels under the watermark, not by detector provenance;
 - use narrow glyph/component masks before any broader box mask;
+- imitate nearby background directly for pure white or low-texture background
+  pixels instead of asking an inpainting algorithm to hallucinate them;
 - run a final publish gate on the cleaned result, not on the method name;
 - keep failed attempts visible in review output but out of `cleaned/`.
 
@@ -188,10 +190,17 @@ mask limits. Oversized masks route to `needs_manual`.
 
 The current repair engine is intentionally small:
 
+- near-area background fill for plain/near-white background pixels;
 - OpenCV Telea inpaint;
 - OpenCV Navier-Stokes inpaint;
 - optional LaMa/IOPaint escalation when installed and enabled;
 - component-level residual cleanup before final rejection.
+
+For pure background, near-area fill is tried before classical inpaint. It
+samples the context ring around the watermark, estimates the local background
+color and tiny texture/noise, and blends that into only the background portion
+of the mask. Product-overlap pixels are handled separately with tiny masks, so
+white background does not get pasted onto black cables or product surfaces.
 
 This project does not yet implement the full 100-tool strategy bank. The next
 big quality step would be better pixel reconstruction for
@@ -228,6 +237,9 @@ It checks:
 - dot-chain/broken-glyph detector passes;
 - rectangular-band detector passes;
 - product-damage detector passes.
+- post-clean Sunsky double-check passes. If OCR sees any domain-like
+  `sunsky-online.com` residue above the suspect threshold, the output fails
+  even when OCR confidence is low.
 
 If any gate fails, status is `needs_manual`. The output may still be written to
 `attempts/` for review, but it is not publishable and is not placed in
@@ -268,8 +280,8 @@ Review columns:
 Original | Mask overlay | Result | Diff x3
 ```
 
-For `needs_manual`, the result column points to `attempts/` if a failed attempt
-exists. This is for inspection only.
+For `needs_manual`, the result column is labeled `Attempt (failed QA)` and
+points to `attempts/` if a failed attempt exists. This is for inspection only.
 
 ## Commands
 
@@ -383,6 +395,8 @@ Each `manifest.jsonl` row contains fields such as:
 - `product_overlap`
 - `cleanup_attempted`
 - `cleanup_strategy`
+- `sunsky_check_pass`
+- `post_clean_ocr_score`
 - `reason`
 
 Useful review patterns:

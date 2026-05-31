@@ -102,6 +102,7 @@ OCR_MATCH_MIN = 0.74
 OCR_DIRECT_MIN = 0.78
 OCR_CROP_MIN = 0.76
 OCR_LOW_CONF_DIRECT_MIN = 0.88
+OCR_POST_CLEAN_SUSPECT_MIN = 0.62
 ENABLE_BRIGHT_RECALL = True
 ENABLE_HIGH_CONTRAST_BOX_MASK = True
 ENABLE_LAMA_ESCALATION = True
@@ -1638,6 +1639,86 @@ def cleanup_residual_components_with_inpaint(
     return cleaned, mask, area
 
 
+def near_area_background_fill_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    mask: np.ndarray,
+    det: Detection,
+    *,
+    risky: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, float]:
+    """Repair watermark pixels on plain background by copying nearby background.
+
+    Telea/NS often creates visible smears on pure white or low-texture product
+    photos. For those pixels, the right operation is simpler: estimate the
+    nearby background from the context ring and paste it back with a feather.
+    Product-overlap pixels are left to a tiny inpaint pass, not a white fill.
+    """
+    if mask is None or np.count_nonzero(mask) == 0:
+        return None, None, 0.0, 0.0
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    pad_x = max(18, int(round(b["w"] * 0.24)))
+    pad_y = max(16, int(round(b["h"] * 1.80)))
+    x1 = max(0, b["x"] - pad_x)
+    y1 = max(0, b["y"] - pad_y)
+    x2 = min(img_w, b["x"] + b["w"] + pad_x)
+    y2 = min(img_h, b["y"] + b["h"] + pad_y)
+
+    window = np.zeros(gray.shape, dtype=np.uint8)
+    window[y1:y2, x1:x2] = 255
+    expanded_mask = cv2.dilate((mask > 0).astype(np.uint8) * 255, np.ones((7, 15), np.uint8), iterations=1)
+    ring = cv2.bitwise_and(window, cv2.bitwise_not(expanded_mask))
+    if np.count_nonzero(ring) < 30:
+        return None, None, 0.0, 0.0
+
+    background = cv2.medianBlur(gray, max(9, min(41, (max(5, b["h"] * 2) // 2) * 2 + 1)))
+    bg_threshold = 216 if risky else 208
+    bg_target = cv2.bitwise_and(mask, ((background >= bg_threshold).astype(np.uint8) * 255))
+    bg_target_area = int(np.count_nonzero(bg_target))
+    if bg_target_area < max(8, int(np.count_nonzero(mask) * 0.18)):
+        return None, None, 0.0, 0.0
+
+    ring_gray = gray[ring > 0]
+    bright_ring = cv2.bitwise_and(ring, ((gray >= bg_threshold).astype(np.uint8) * 255))
+    if np.count_nonzero(bright_ring) >= 24:
+        ring_pixels = img[bright_ring > 0]
+    elif det.roi_class in {"low_texture_background", "near_white", "plain_white"}:
+        ring_pixels = img[ring > 0]
+    else:
+        return None, None, 0.0, 0.0
+    if ring_pixels.size == 0:
+        return None, None, 0.0, 0.0
+
+    fill = np.median(ring_pixels.reshape(-1, 3), axis=0).astype(np.float32)
+    noise_sigma = np.clip(np.std(ring_pixels.reshape(-1, 3), axis=0), 0.0, 2.5)
+    fill_img = np.zeros_like(img, dtype=np.float32)
+    fill_img[:, :] = fill.reshape(1, 1, 3)
+    if float(np.max(noise_sigma)) > 0.2:
+        yy, xx = np.indices(gray.shape)
+        pseudo = (((xx * 17 + yy * 31 + b["x"] * 7 + b["y"] * 13) % 23) - 11).astype(np.float32) / 11.0
+        fill_img += pseudo[:, :, None] * noise_sigma.reshape(1, 1, 3)
+
+    bg_target = cv2.dilate(bg_target, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)), iterations=1)
+    alpha = cv2.GaussianBlur(bg_target, (0, 0), 0.9).astype(np.float32)[:, :, None] / 255.0
+    candidate = img.astype(np.float32) * (1.0 - alpha) + fill_img * alpha
+    candidate = np.uint8(np.clip(candidate, 0, 255))
+
+    foreground_mask = cv2.bitwise_and(mask, cv2.bitwise_not(bg_target))
+    foreground_area = float(np.count_nonzero(foreground_mask)) / max(1, mask.size)
+    if np.count_nonzero(foreground_mask) >= 4 and foreground_area <= (0.0045 if risky else 0.010):
+        candidate = cv2.inpaint(candidate, foreground_mask, 2 if risky else 3, cv2.INPAINT_TELEA)
+        effective_mask = cv2.bitwise_or(bg_target, foreground_mask)
+    else:
+        effective_mask = bg_target
+
+    area = float(np.count_nonzero(effective_mask)) / max(1, effective_mask.size)
+    bg_fraction = bg_target_area / max(1, np.count_nonzero(mask))
+    if area > (0.014 if risky else 0.026):
+        return None, effective_mask, area, bg_fraction
+    return candidate, effective_mask, area, float(bg_fraction)
+
+
 def evaluate_cleaned_output(
     original: np.ndarray,
     candidate: np.ndarray,
@@ -1772,7 +1853,11 @@ def final_publish_gate(
         and float(metrics["template_residual_score"]) <= FINAL_TEMPLATE_MAX
         and int(metrics["post_text_components"]) <= FINAL_TEXT_COMPONENTS_MAX
         and (post_count == 0)
-        and not bool(ocr_meta.get("ocr_watermark"))
+    )
+    post_ocr_score = float(ocr_meta.get("ocr_watermark_score") or 0.0)
+    sunsky_check_pass = (
+        not bool(ocr_meta.get("ocr_watermark"))
+        and post_ocr_score < OCR_POST_CLEAN_SUSPECT_MIN
     )
     dot_pass = not bool(dot_metrics.get("dot_chain_fail"))
     band_pass = not bool(band_metrics.get("band_gate_fail"))
@@ -1788,13 +1873,17 @@ def final_publish_gate(
         reject_reasons.append("visible_rectangular_band")
     if not product_pass:
         reject_reasons.append("product_damage")
-    publish_ok = metrics_valid and residual_pass and dot_pass and band_pass and product_pass
+    if not sunsky_check_pass:
+        reject_reasons.append("post_clean_sunsky_detected")
+    publish_ok = metrics_valid and residual_pass and sunsky_check_pass and dot_pass and band_pass and product_pass
     return {
         "publish_ok": bool(publish_ok),
         "status": "cleaned" if publish_ok else "needs_manual",
         "reject_reasons": reject_reasons,
         "metrics_valid": bool(metrics_valid),
         "residual_pass": bool(residual_pass),
+        "sunsky_check_pass": bool(sunsky_check_pass),
+        "post_clean_ocr_score": post_ocr_score,
         "dot_chain_pass": bool(dot_pass),
         "band_pass": bool(band_pass),
         "product_gate_pass": bool(product_pass),
@@ -1942,6 +2031,37 @@ def clean_image(
         area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
         if area > area_limit:
             continue
+        near_candidate, near_mask, near_area, bg_fraction = near_area_background_fill_repair(
+            img,
+            gray,
+            mask,
+            det,
+            risky=risky_product_roi,
+        )
+        if near_candidate is not None and near_mask is not None:
+            cgray = cv2.cvtColor(near_candidate, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, near_mask) / max(laplacian_var(gray, near_mask), 1e-6)
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            cost = (
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.18
+                + near_area * 6.0
+                + max(0.0, 0.12 - sharpness_ratio) * 0.30
+                - min(0.18, bg_fraction * 0.10)
+            )
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                near_area,
+                f"{variant}_near_area_fill",
+                near_candidate,
+                near_mask,
+                metrics,
+            ))
         for method_name, method in (("telea", cv2.INPAINT_TELEA), ("ns", cv2.INPAINT_NS)):
             candidate = cv2.inpaint(img, mask, radius, method)
             cgray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
@@ -2168,6 +2288,8 @@ def clean_image(
         "layout_risk": det.layout_risk,
         "metrics_valid": gate_meta["metrics_valid"],
         "residual_pass": gate_meta["residual_pass"],
+        "sunsky_check_pass": gate_meta["sunsky_check_pass"],
+        "post_clean_ocr_score": round(float(gate_meta["post_clean_ocr_score"]), 4),
         "dot_chain_pass": gate_meta["dot_chain_pass"],
         "band_pass": gate_meta["band_pass"],
         "product_gate_pass": gate_meta["product_gate_pass"],
@@ -2253,6 +2375,16 @@ def clean_all_detections(
         for item in details
         if isinstance(item.get("post_clean_detection_count"), int)
     ]
+    post_clean_ocr_scores = [
+        float(item["post_clean_ocr_score"])
+        for item in details
+        if isinstance(item.get("post_clean_ocr_score"), (int, float))
+    ]
+    sunsky_check_passes = [
+        bool(item["sunsky_check_pass"])
+        for item in details
+        if "sunsky_check_pass" in item
+    ]
     combined_area = float(np.count_nonzero(combined_mask)) / max(1, combined_mask.size)
     warnings = [str(item.get("warning")) for item in details if item.get("warning")]
     strategies = [str(item.get("strategy")) for item in details if item.get("strategy")]
@@ -2277,6 +2409,8 @@ def clean_all_detections(
         "mask_area_pct": round(combined_area * 100, 3),
         "post_text_score": round(max(text_scores), 4) if text_scores else 0.0,
         "post_text_components": max(text_components) if text_components else 0,
+        "post_clean_ocr_score": round(max(post_clean_ocr_scores), 4) if post_clean_ocr_scores else None,
+        "sunsky_check_pass": all(sunsky_check_passes) if sunsky_check_passes else None,
         "detection_results": details,
     }
     if status == "needs_manual":
@@ -2344,18 +2478,21 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
             meta_parts.append(f"visible {row.get('residual_score')}")
         if "template_residual_score" in row:
             meta_parts.append(f"template {row.get('template_residual_score')}")
+        if row.get("post_clean_ocr_score") is not None:
+            meta_parts.append(f"postOCR {row.get('post_clean_ocr_score')}")
         if row.get("presence_reason"):
             meta_parts.append(str(row.get("presence_reason")))
         if row.get("detection", {}).get("roi_class"):
             meta_parts.append(f"roi {row['detection']['roi_class']}")
         meta = html.escape(" | ".join(part for part in meta_parts if part))
+        result_label = "Cleaned" if row.get("status") == "cleaned" else "Attempt (failed QA)"
         body.append(f"""
 <section class="card">
   <div class="head"><h2>#{idx} {fname}</h2><div class="meta">{meta}</div></div>
   <div class="grid">
     <div class="pane"><img src="{original}" alt="Original"><div class="label">Original</div></div>
     <div class="pane"><img src="{mask}" alt="Mask overlay"><div class="label">Mask overlay</div></div>
-    <div class="pane"><img src="{cleaned}" alt="Result"><div class="label">Result</div></div>
+    <div class="pane"><img src="{cleaned}" alt="Result"><div class="label">{html.escape(result_label)}</div></div>
     <div class="pane"><img src="{diff}" alt="Difference"><div class="label">Diff x3</div></div>
   </div>
 </section>""")
@@ -2416,7 +2553,7 @@ def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
     panes = [
         ("Original", "review_original"),
         ("Mask overlay", "review_mask"),
-        ("Result", "review_cleaned"),
+        ("__RESULT__", "review_cleaned"),
         ("Diff x3", "review_diff"),
     ]
     pages = []
@@ -2432,6 +2569,7 @@ def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
             ("mask_area_pct", "mask"),
             ("residual_score", "visible"),
             ("template_residual_score", "template"),
+            ("post_clean_ocr_score", "postOCR"),
             ("post_text_components", "components"),
             ("presence_score", "presence"),
         ]:
@@ -2448,6 +2586,9 @@ def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
         )
 
         for col, (label, rel_key) in enumerate(panes):
+            pane_label = label
+            if label == "__RESULT__":
+                pane_label = "Cleaned" if row.get("status") == "cleaned" else "Attempt (failed QA)"
             x = margin + col * (col_w + gap)
             y = margin + header_h
             rel_path = row.get(rel_key)
@@ -2459,7 +2600,7 @@ def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
             py = y + (img_h - img.height) // 2
             page.paste(img, (px, py))
             draw.rectangle([x, y + img_h, x + col_w, y + img_h + label_h], fill="#f8fafc", outline="#d8dee8")
-            draw.text((x + 12, y + img_h + 7), label, fill="#334155", font=label_font)
+            draw.text((x + 12, y + img_h + 7), pane_label, fill="#334155", font=label_font)
         draw.text(
             (margin, page_size[1] - 24),
             f"Clearmark visual review PDF: {out_dir}",
