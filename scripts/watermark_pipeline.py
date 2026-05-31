@@ -89,6 +89,8 @@ DOT_CHAIN_SPAN_MIN = 0.22
 DOT_CHAIN_AREA_RATIO_MIN = 0.035
 VISIBLE_BAND_SCORE_MAX = 0.18
 VISIBLE_BAND_LUMA_DELTA_MAX = 8.0
+RESIDUAL_CLEANUP_AREA_MAX = 0.016
+RESIDUAL_CLEANUP_RISKY_AREA_MAX = 0.006
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
@@ -1515,8 +1517,8 @@ def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
     """Detect dot-chain or broken-glyph residue in the known watermark footprint."""
     img_h, img_w = gray.shape[:2]
     b = det.mark_box
-    pad_x = max(8, int(round(b["w"] * 0.18)))
-    pad_y = max(5, int(round(b["h"] * 0.45)))
+    pad_x = max(10, int(round(b["w"] * 0.25)))
+    pad_y = max(6, int(round(b["h"] * 0.55)))
     x1 = max(0, b["x"] - pad_x)
     y1 = max(0, b["y"] - pad_y)
     x2 = min(img_w, b["x"] + b["w"] + pad_x)
@@ -1529,6 +1531,7 @@ def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
             "dot_component_count": 0,
             "dot_horizontal_span": 0.0,
             "dot_component_area_ratio": 0.0,
+            "component_mask_area": 0.0,
             "dot_chain_fail": False,
             "component_mask": full_mask,
         }
@@ -1536,7 +1539,8 @@ def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
     kernel = max(5, min(31, (roi.shape[0] // 2) * 2 + 1))
     background = cv2.medianBlur(roi, kernel)
     dev = cv2.absdiff(roi, background)
-    threshold = max(3.0, float(np.percentile(dev, 86)))
+    percentile = 84 if det.product_overlap >= 0.42 else 80
+    threshold = max(2.0, float(np.percentile(dev, percentile)))
     raw = (dev >= threshold).astype(np.uint8) * 255
     count, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
     kept = np.zeros_like(raw)
@@ -1572,11 +1576,13 @@ def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
         )
     )
     full_mask[y1:y2, x1:x2] = kept
+    component_mask_area = float(np.count_nonzero(full_mask)) / max(1, full_mask.size)
     return {
         "dot_chain_score": float(score),
         "dot_component_count": int(components),
         "dot_horizontal_span": float(horizontal_span),
         "dot_component_area_ratio": float(area_ratio),
+        "component_mask_area": component_mask_area,
         "dot_chain_fail": bool(fail),
         "component_mask": full_mask,
     }
@@ -1608,6 +1614,47 @@ def cleanup_residual_components_with_ring_fill(img: np.ndarray, component_mask: 
     alpha = cv2.GaussianBlur(mask, (0, 0), 0.8).astype(np.float32)[:, :, None] / 255.0
     cleaned = img.astype(np.float32) * (1.0 - alpha) + fill.reshape(1, 1, 3).astype(np.float32) * alpha
     return np.uint8(np.clip(cleaned, 0, 255))
+
+
+def cleanup_residual_components_with_inpaint(
+    img: np.ndarray,
+    component_mask: np.ndarray,
+    det: Detection,
+    *,
+    risky: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+    if component_mask is None or np.count_nonzero(component_mask) < 4:
+        return None, None, 0.0
+    area_limit = RESIDUAL_CLEANUP_RISKY_AREA_MAX if risky else RESIDUAL_CLEANUP_AREA_MAX
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 3))
+    mask = cv2.dilate((component_mask > 0).astype(np.uint8) * 255, kernel, iterations=1)
+    if not risky:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 9), np.uint8), iterations=1)
+    area = float(np.count_nonzero(mask)) / max(1, mask.size)
+    if area <= 0.0 or area > area_limit:
+        return None, mask, area
+    radius = 2 if risky else 3
+    cleaned = cv2.inpaint(img, mask, radius, cv2.INPAINT_TELEA)
+    return cleaned, mask, area
+
+
+def evaluate_cleaned_output(
+    original: np.ndarray,
+    candidate: np.ndarray,
+    mask: np.ndarray,
+    det: Detection,
+    templates: list[TemplateSpec] | None,
+    ocr_reader,
+) -> tuple[np.ndarray, dict, int | None, dict, dict, dict, dict, dict]:
+    cgray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+    metrics = residual_quality_metrics(cgray, det, templates)
+    post_count = post_clean_detection_count(candidate, cgray, templates)
+    ocr_meta = cleaned_crop_ocr_check(candidate, det, ocr_reader)
+    dot_metrics = residual_component_metrics(cgray, det)
+    band_metrics = detect_rectangular_band_visibility(original, candidate, mask)
+    product_metrics = detect_product_damage_v13(original, candidate, mask, det)
+    gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics)
+    return cgray, metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics, gate_meta
 
 
 def detect_rectangular_band_visibility(original: np.ndarray, candidate: np.ndarray, mask: np.ndarray | None) -> dict:
@@ -1774,8 +1821,8 @@ def padded_crop(img: np.ndarray, box: dict, pad_x: int, pad_y: int) -> np.ndarra
 
 def cleaned_crop_ocr_check(img: np.ndarray, det: Detection, reader) -> dict:
     """Run OCR on the cleaned mark-box crop only."""
-    pad_x = max(8, int(round(det.mark_box["w"] * 0.12)))
-    pad_y = max(6, int(round(det.mark_box["h"] * 0.75)))
+    pad_x = max(12, int(round(det.mark_box["w"] * 0.22)))
+    pad_y = max(8, int(round(det.mark_box["h"] * 1.00)))
     crop = padded_crop(img, det.mark_box, pad_x, pad_y)
     return ocr_image_watermark_check(crop, reader)
 
@@ -1936,13 +1983,16 @@ def clean_image(
     selected_eval: dict | None = None
     for cand in candidates[:10]:
         _, cresidual, ctemplate_residual, cratio, carea, cname, cbest, cmask, cmetrics = cand
-        cgray = cv2.cvtColor(cbest, cv2.COLOR_BGR2GRAY)
-        cpost_count = post_clean_detection_count(cbest, cgray, templates)
-        cocr_meta = cleaned_crop_ocr_check(cbest, det, ocr_reader)
-        cdot_metrics = residual_component_metrics(cgray, det)
-        cband_metrics = detect_rectangular_band_visibility(img, cbest, cmask)
-        cproduct_metrics = detect_product_damage_v13(img, cbest, cmask, det)
-        cgate_meta = final_publish_gate(cmetrics, cpost_count, cocr_meta, cdot_metrics, cband_metrics, cproduct_metrics)
+        (
+            cgray,
+            cmetrics,
+            cpost_count,
+            cocr_meta,
+            cdot_metrics,
+            cband_metrics,
+            cproduct_metrics,
+            cgate_meta,
+        ) = evaluate_cleaned_output(img, cbest, cmask, det, templates, ocr_reader)
         if cgate_meta["publish_ok"]:
             selected = cand
             selected_eval = {
@@ -1992,45 +2042,77 @@ def clean_image(
         product_metrics = selected_eval["product_metrics"]
         gate_meta = selected_eval["gate_meta"]
     else:
-        best_gray = cv2.cvtColor(best, cv2.COLOR_BGR2GRAY)
-        post_count = post_clean_detection_count(best, best_gray, templates)
-        ocr_meta = cleaned_crop_ocr_check(best, det, ocr_reader)
-        dot_metrics = residual_component_metrics(best_gray, det)
-        band_metrics = detect_rectangular_band_visibility(img, best, mask)
-        product_metrics = detect_product_damage_v13(img, best, mask, det)
-        gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics)
+        (
+            best_gray,
+            metrics,
+            post_count,
+            ocr_meta,
+            dot_metrics,
+            band_metrics,
+            product_metrics,
+            gate_meta,
+        ) = evaluate_cleaned_output(img, best, mask, det, templates, ocr_reader)
     broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
     position_confident = not det.template.startswith("prior:")
 
     cleanup_attempted = False
-    if (
+    cleanup_strategy = ""
+    cleanup_mask_area = 0.0
+    cleanup_reasons = set(gate_meta["reject_reasons"])
+    residual_cleanup_needed = (
         not gate_meta["publish_ok"]
-        and "dot_chain_residual" in gate_meta["reject_reasons"]
-        and metrics["residual_score"] <= 0.32
-        and metrics["template_residual_score"] <= 0.34
-    ):
+        and (
+            "dot_chain_residual" in cleanup_reasons
+            or "residual_visible" in cleanup_reasons
+            or bool(ocr_meta.get("ocr_watermark"))
+        )
+        and "product_damage" not in cleanup_reasons
+        and "visible_rectangular_band" not in cleanup_reasons
+    )
+    if residual_cleanup_needed:
         cleanup_attempted = True
-        cleanup = cleanup_residual_components_with_ring_fill(best, dot_metrics["component_mask"], det)
-        if cleanup is not None:
-            cgray = cv2.cvtColor(cleanup, cv2.COLOR_BGR2GRAY)
-            cleanup_metrics = residual_quality_metrics(cgray, det, templates)
-            cleanup_post_count = post_clean_detection_count(cleanup, cgray, templates)
-            cleanup_ocr_meta = cleaned_crop_ocr_check(cleanup, det, ocr_reader)
-            cleanup_dot_metrics = residual_component_metrics(cgray, det)
-            cleanup_band_metrics = detect_rectangular_band_visibility(img, cleanup, mask)
-            cleanup_product_metrics = detect_product_damage_v13(img, cleanup, mask, det)
-            cleanup_gate = final_publish_gate(
+        cleanup_candidates: list[tuple[str, np.ndarray, np.ndarray, float]] = []
+        ring_cleanup = cleanup_residual_components_with_ring_fill(best, dot_metrics["component_mask"], det)
+        if ring_cleanup is not None:
+            ring_mask = cv2.dilate((dot_metrics["component_mask"] > 0).astype(np.uint8) * 255, np.ones((3, 5), np.uint8), iterations=1)
+            ring_area = float(np.count_nonzero(ring_mask)) / max(1, ring_mask.size)
+            cleanup_candidates.append(("residual_ring_fill", ring_cleanup, ring_mask, ring_area))
+        inpaint_cleanup, inpaint_mask, inpaint_area = cleanup_residual_components_with_inpaint(
+            best,
+            dot_metrics["component_mask"],
+            det,
+            risky=risky_product_roi,
+        )
+        if inpaint_cleanup is not None and inpaint_mask is not None:
+            cleanup_candidates.append(("residual_component_inpaint", inpaint_cleanup, inpaint_mask, inpaint_area))
+
+        best_cleanup_score = (
+            float(metrics["residual_score"])
+            + float(metrics["template_residual_score"]) * 0.35
+            + (1.0 if ocr_meta.get("ocr_watermark") else 0.0)
+        )
+        for cname, cleanup, cleanup_mask, carea in cleanup_candidates:
+            combined_cleanup_mask = cv2.bitwise_or(mask, cleanup_mask)
+            (
+                cgray,
                 cleanup_metrics,
                 cleanup_post_count,
                 cleanup_ocr_meta,
                 cleanup_dot_metrics,
                 cleanup_band_metrics,
                 cleanup_product_metrics,
+                cleanup_gate,
+            ) = evaluate_cleaned_output(img, cleanup, combined_cleanup_mask, det, templates, ocr_reader)
+            cleanup_score = (
+                float(cleanup_metrics["residual_score"])
+                + float(cleanup_metrics["template_residual_score"]) * 0.35
+                + (1.0 if cleanup_ocr_meta.get("ocr_watermark") else 0.0)
+                + (0.50 if cleanup_product_metrics.get("product_gate_fail") else 0.0)
+                + (0.35 if cleanup_band_metrics.get("band_gate_fail") else 0.0)
             )
-            if cleanup_gate["publish_ok"] or (
-                cleanup_metrics["residual_score"] < metrics["residual_score"]
-                and cleanup_metrics["template_residual_score"] <= metrics["template_residual_score"] + 0.04
-            ):
+            meaningful_improvement = cleanup_score <= best_cleanup_score - 0.08
+            if cleanup_gate["publish_ok"] or meaningful_improvement:
+                best_cleanup_score = cleanup_score
                 best = cleanup
                 best_gray = cgray
                 metrics = cleanup_metrics
@@ -2042,7 +2124,11 @@ def clean_image(
                 band_metrics = cleanup_band_metrics
                 product_metrics = cleanup_product_metrics
                 gate_meta = cleanup_gate
-                name = f"{name}_micro_cleanup"
+                mask = combined_cleanup_mask
+                area = float(np.count_nonzero(mask)) / max(1, mask.size)
+                cleanup_strategy = cname
+                cleanup_mask_area = carea
+                name = f"{name}_{cname}"
 
     status = gate_meta["status"]
     reject_reasons = list(gate_meta["reject_reasons"])
@@ -2097,6 +2183,8 @@ def clean_image(
         "product_blob_score": round(float(product_metrics["product_blob_score"]), 4),
         "product_changed_area_ratio": round(float(product_metrics["product_changed_area_ratio"]), 4),
         "cleanup_attempted": cleanup_attempted,
+        "cleanup_strategy": cleanup_strategy,
+        "cleanup_mask_area_pct": round(cleanup_mask_area * 100, 3),
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
         meta.update({
@@ -2615,10 +2703,14 @@ def process_file(
         mask_path = out_dir / "masks" / path.name
         copy_or_write_image(mask_path, mask)
         entry["mask"] = str(mask_path)
-    if cleaned is not None:
+    if cleaned is not None and meta.get("status") == "cleaned":
         clean_path = out_dir / "cleaned" / path.name
         copy_or_write_image(clean_path, cleaned)
         entry["cleaned"] = str(clean_path)
+    elif cleaned is not None:
+        attempt_path = out_dir / "attempts" / path.name
+        copy_or_write_image(attempt_path, cleaned)
+        entry["attempt"] = str(attempt_path)
     if review:
         original_path = out_dir / "originals" / path.name
         original_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2633,8 +2725,10 @@ def process_file(
             overlay_path = out_dir / "overlays" / path.name
             write_mask_overlay(overlay_path, img, None)
             entry["review_mask"] = f"overlays/{path.name}"
-        if cleaned is not None:
+        if cleaned is not None and meta.get("status") == "cleaned":
             entry["review_cleaned"] = f"cleaned/{path.name}"
+        elif cleaned is not None:
+            entry["review_cleaned"] = f"attempts/{path.name}"
         elif mask is not None:
             # Show source in result column for manual rows, so review layout stays intact.
             entry["review_cleaned"] = f"originals/{path.name}"

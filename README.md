@@ -58,11 +58,15 @@ Implemented stages:
    high-contrast fallback box only when the ROI is not product-risky.
 6. Repair tries OpenCV Telea/Navier-Stokes first and optionally escalates to
    LaMa/IOPaint when available for high-residual cases.
-7. The publish decision is driven by post-clean evidence: residual score,
+7. Before giving up on a repair, a residual micro-cleanup pass targets only
+   leftover dot-chain/broken-glyph components inside the expanded watermark
+   footprint. It uses ring-fill or small-radius inpaint on those pixels, not a
+   full rectangular re-clean.
+8. The publish decision is driven by post-clean evidence: residual score,
    template residual, post-clean text components, post-clean detection count,
    dot-chain fragments, rectangular-band score, product-damage score, and OCR
    on the cleaned mark-box crop.
-8. Review output shows original, mask overlay, result, and `diff x3` so visible
+9. Review output shows original, mask overlay, result, and `diff x3` so visible
    bands, damaged product detail, or leftover glyph fragments are easy to spot.
 
 The third-party V12 ideas that matter for this repo are now documented as the
@@ -166,6 +170,7 @@ Each run creates:
 ```text
 outputs/<run-id>/ or custom --out/
   cleaned/          cleaned image copies when post-clean QA passes
+  attempts/         failed best attempts for review only; never publish these
   masks/            black/white masks
   originals/        copied originals for review only
   overlays/         original images with red mask overlay
