@@ -12,10 +12,13 @@ import argparse
 import html
 import json
 import math
+import os
 import random
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -69,6 +72,11 @@ INPAINT_RADIUS = 5
 SHARPNESS_MIN_RATIO = 0.30
 TEXT_LIKENESS_MIN = 0.12
 CLEAN_VISIBLE_RESIDUAL_MAX = 0.48
+CLEAN_STRICT_RESIDUAL_MAX = 0.25
+CLEAN_STRICT_TEMPLATE_MAX = 0.30
+CLEAN_FAIL_RESIDUAL_MIN = 0.45
+CLEAN_FAIL_TEXT_COMPONENTS = 4
+LAMA_ESCALATION_RESIDUAL_MIN = 0.40
 ARTIFACT_SHARPNESS_REVIEW_RATIO = 0.18
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
@@ -76,8 +84,12 @@ HIGH_CONTRAST_SPAN = 200.0
 REVIEW_CONTRAST_SPAN = 170.0
 FALLBACK_CONTRAST_SPAN = 150.0
 LINE_DOMINANCE_MAX = 0.72
-OCR_WATERMARK_RE = re.compile(r"(sunsky|sky.*onlin|onlin.*com|onlinecom|olne.*com|alinec)")
+OCR_WATERMARK_RE = re.compile(r"(sunsky|sunsk|sursky|sky.*onlin|onlin.*com|onlinecom|olne.*com|alinec|sun.*com)")
+ENABLE_BRIGHT_RECALL = True
+ENABLE_HIGH_CONTRAST_BOX_MASK = True
+ENABLE_LAMA_ESCALATION = True
 _CANONICAL_INK_MASK: np.ndarray | None = None
+_SIMPLE_LAMA = None
 
 
 @dataclass
@@ -691,6 +703,201 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
     return detections
 
 
+def ocr_image_watermark_check(img: np.ndarray, reader, *, canvas_size: int = 960, mag_ratio: float = 2.5) -> dict:
+    if reader is None or img.size == 0:
+        return {"ocr_checked": False, "ocr_watermark": None, "ocr_text": []}
+    try:
+        results = reader.readtext(
+            img,
+            detail=1,
+            paragraph=False,
+            text_threshold=0.16,
+            low_text=0.04,
+            link_threshold=0.08,
+            canvas_size=canvas_size,
+            mag_ratio=mag_ratio,
+        )
+    except Exception as exc:
+        return {
+            "ocr_checked": False,
+            "ocr_watermark": None,
+            "ocr_text": [],
+            "ocr_error": type(exc).__name__,
+        }
+    texts: list[str] = []
+    watermark = False
+    for _, text, conf in results:
+        text = str(text)
+        if not text.strip():
+            continue
+        texts.append(f"{text}:{float(conf):.2f}")
+        if ocr_text_matches_watermark(text):
+            watermark = True
+    return {
+        "ocr_checked": True,
+        "ocr_watermark": watermark,
+        "ocr_text": texts[:6],
+    }
+
+
+def bright_text_likeness(gray: np.ndarray, box: dict) -> tuple[float, int, float]:
+    """Score faint grey text on white or bright backgrounds.
+
+    The regular text_likeness path is tuned for ordinary contrast. This variant
+    boosts only darker-than-background structure, which catches faint Sunsky text
+    on white areas without treating bright product highlights as glyphs.
+    """
+    img_h, img_w = gray.shape[:2]
+    x = max(0, int(box["x"]))
+    y = max(0, int(box["y"]))
+    w = max(1, min(int(box["w"]), img_w - x))
+    h = max(1, min(int(box["h"]), img_h - y))
+    roi = gray[y:y + h, x:x + w]
+    if roi.shape[0] < 8 or roi.shape[1] < 40:
+        return 0.0, 0, 0.0
+
+    bright_ratio = float(np.mean(roi >= 190))
+    if bright_ratio < 0.42 or float(np.mean(roi)) < 170.0:
+        return 0.0, 0, bright_ratio
+
+    kernel = max(5, min(35, (roi.shape[0] // 2) * 2 + 1))
+    background = cv2.medianBlur(roi, kernel)
+    dark_dev = cv2.subtract(background, roi)
+    if float(np.percentile(dark_dev, 96)) < 2.0:
+        return 0.0, 0, bright_ratio
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    boosted = clahe.apply(dark_dev)
+    threshold = max(7.0, float(np.percentile(boosted, 86)))
+    glyphs = (boosted >= threshold).astype(np.uint8) * 255
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(glyphs, 8)
+    components = []
+    for idx in range(1, count):
+        xx, yy, ww, hh, area = stats[idx]
+        if area < 2 or area > roi.size * 0.12:
+            continue
+        if hh < 2 or hh > roi.shape[0] * 0.90:
+            continue
+        if ww > roi.shape[1] * 0.38:
+            continue
+        components.append((xx, yy, ww, hh, area))
+
+    if components:
+        xs = []
+        for xx, _, ww, _, _ in components:
+            xs.extend([xx, xx + ww])
+        coverage = (max(xs) - min(xs)) / max(roi.shape[1], 1)
+    else:
+        coverage = 0.0
+    density = sum(area for *_, area in components) / max(roi.size, 1)
+    darkness = min(1.0, float(np.percentile(dark_dev, 97)) / 18.0)
+    score = (
+        min(1.0, len(components) / 14.0) * 0.42
+        + min(1.0, coverage) * 0.34
+        + min(1.0, density * 28.0) * 0.14
+        + darkness * 0.10
+    )
+    return float(score), len(components), bright_ratio
+
+
+def bright_background_text_band_detections(
+    gray: np.ndarray,
+    img: np.ndarray | None = None,
+    ocr_reader=None,
+) -> list[Detection]:
+    """Recall pass for faint Sunsky marks over bright/white backgrounds."""
+    img_h, img_w = gray.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV) if img is not None else None
+    detections: list[Detection] = []
+    width_fracs = (0.28, 0.32, 0.36, 0.40, 0.44)
+    x_fracs = (0.18, 0.24, 0.30, 0.36, 0.42)
+    y_fracs = (0.34, 0.42, 0.50, 0.58, 0.66)
+    for wf in width_fracs:
+        bw = int(round(img_w * wf))
+        if bw < 85:
+            continue
+        for aspect in (7.0, 8.2, 9.4):
+            bh = int(round(max(13, bw / aspect)))
+            if bh < 11 or bh > img_h * 0.075:
+                continue
+            for xf in x_fracs:
+                x = int(round(img_w * xf))
+                if x + bw > img_w:
+                    continue
+                for yf in y_fracs:
+                    y = int(round(img_h * yf - bh / 2))
+                    box = clamp_box(x, y, bw, bh, img_w, img_h)
+                    score, components, bright_ratio = bright_text_likeness(gray, box)
+                    if score < 0.70 or components < 12:
+                        continue
+                    roi = gray[box["y"]:box["y"] + box["h"], box["x"]:box["x"] + box["w"]]
+                    if roi.size and float(np.mean(roi < 120)) > 0.38:
+                        continue
+                    regular_score, regular_components = text_likeness(gray, box)
+                    features = band_features(gray, box)
+                    if features["contrast_span"] > 235.0 or features["line_dominance"] > 0.55:
+                        continue
+                    if features["contrast_span"] > 165.0 and (score < 0.92 or features["line_dominance"] > 0.32):
+                        continue
+                    if features["contrast_span"] > 165.0 and (regular_score < 0.72 or regular_components < 10):
+                        continue
+                    if img is not None and ocr_reader is not None:
+                        pad_x = max(8, int(round(box["w"] * 0.12)))
+                        pad_y = max(6, int(round(box["h"] * 0.75)))
+                        x1 = max(0, box["x"] - pad_x)
+                        y1 = max(0, box["y"] - pad_y)
+                        x2 = min(img_w, box["x"] + box["w"] + pad_x)
+                        y2 = min(img_h, box["y"] + box["h"] + pad_y)
+                        ocr_meta = ocr_image_watermark_check(img[y1:y2, x1:x2], ocr_reader)
+                        if (
+                            ocr_meta.get("ocr_checked")
+                            and ocr_meta.get("ocr_text")
+                            and not ocr_meta.get("ocr_watermark")
+                        ):
+                            continue
+                    elif features["contrast_span"] > 165.0 and regular_components < 22:
+                        continue
+                    if hsv is not None:
+                        sat_roi = hsv[
+                            box["y"]:box["y"] + box["h"],
+                            box["x"]:box["x"] + box["w"],
+                            1,
+                        ]
+                        if float(np.mean(sat_roi > 70)) > 0.18:
+                            continue
+                    area_pct = 100.0 * box["w"] * box["h"] / max(1, img_w * img_h)
+                    if area_pct > 100 * MAX_MASK_AREA:
+                        continue
+                    cx = box["x"] + box["w"] / 2
+                    cy = box["y"] + box["h"] / 2
+                    center_bias = 1.0 - min(1.0, (
+                        abs(cx - img_w * 0.50) / max(img_w * 0.50, 1)
+                        + abs(cy - img_h * 0.54) / max(img_h * 0.54, 1)
+                    ) / 2)
+                    confidence = (
+                        score * 0.58
+                        + min(1.0, components / 16.0) * 0.16
+                        + bright_ratio * 0.10
+                        + center_bias * 0.16
+                    )
+                    detections.append(Detection(
+                        x=box["x"], y=box["y"], w=box["w"], h=box["h"],
+                        score=float(confidence),
+                        verify_score=max(0.42, score * 0.38 + center_bias * 0.22),
+                        template="prior:bright_text_band",
+                        scale=1.0,
+                        mark_box=box,
+                        mask_area_pct=area_pct,
+                        text_score=max(score, regular_score),
+                        text_components=max(components, regular_components),
+                        contrast_span=features["contrast_span"],
+                        line_dominance=features["line_dominance"],
+                        confidence=float(min(0.86, confidence)),
+                    ))
+    return detections
+
+
 def prior_text_band_detections(gray: np.ndarray, img: np.ndarray | None = None) -> list[Detection]:
     """Find faint center-body text bands when template correlation is weak.
 
@@ -855,6 +1062,8 @@ def detect_watermark(
                     line_dominance=features["line_dominance"],
                     confidence=confidence,
                 ))
+    if ENABLE_BRIGHT_RECALL and not found and ocr_reader is not None:
+        found.extend(bright_background_text_band_detections(gray, img=img, ocr_reader=ocr_reader))
     return nms(found, img_w, img_h, int(preset["max_detections"]))
 
 
@@ -985,20 +1194,113 @@ def laplacian_var(gray: np.ndarray, mask: np.ndarray | None = None) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def padded_crop(img: np.ndarray, box: dict, pad_x: int, pad_y: int) -> np.ndarray:
+    img_h, img_w = img.shape[:2]
+    x1 = max(0, int(box["x"]) - pad_x)
+    y1 = max(0, int(box["y"]) - pad_y)
+    x2 = min(img_w, int(box["x"] + box["w"]) + pad_x)
+    y2 = min(img_h, int(box["y"] + box["h"]) + pad_y)
+    return img[y1:y2, x1:x2]
+
+
+def cleaned_crop_ocr_check(img: np.ndarray, det: Detection, reader) -> dict:
+    """Run OCR on the cleaned mark-box crop only."""
+    pad_x = max(8, int(round(det.mark_box["w"] * 0.12)))
+    pad_y = max(6, int(round(det.mark_box["h"] * 0.75)))
+    crop = padded_crop(img, det.mark_box, pad_x, pad_y)
+    return ocr_image_watermark_check(crop, reader)
+
+
+def post_clean_detection_count(
+    img: np.ndarray,
+    gray: np.ndarray,
+    templates: list[TemplateSpec] | None,
+) -> int | None:
+    if templates is None:
+        return None
+    try:
+        return len(detect_watermark(gray, templates, "review", img=img, ocr_reader=None))
+    except Exception:
+        return None
+
+
+def run_lama_escalation(img: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray | None, str]:
+    """Optional LaMa/IOPaint backend. It is used only when installed locally."""
+    global _SIMPLE_LAMA
+    try:
+        from simple_lama_inpainting import SimpleLama  # type: ignore
+    except Exception:
+        SimpleLama = None  # type: ignore
+    if SimpleLama is not None:
+        try:
+            if _SIMPLE_LAMA is None:
+                _SIMPLE_LAMA = SimpleLama()
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            result = _SIMPLE_LAMA(rgb, mask)
+            arr = np.array(result)
+            if arr.shape[:2] != img.shape[:2]:
+                arr = arr[:img.shape[0], :img.shape[1]]
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR), "simple_lama"
+        except Exception as exc:
+            return None, f"simple_lama:{type(exc).__name__}"
+
+    command = os.environ.get("CLEARMARK_IOPAINT_CMD") or shutil.which("iopaint")
+    if not command:
+        return None, "unavailable"
+    with tempfile.TemporaryDirectory(prefix="clearmark-iopaint-") as tmp:
+        tmp_dir = Path(tmp)
+        image_path = tmp_dir / "image.png"
+        mask_path = tmp_dir / "mask.png"
+        output_path = tmp_dir / "output.png"
+        cv2.imwrite(str(image_path), img)
+        cv2.imwrite(str(mask_path), mask)
+        cmd = [
+            command,
+            "run",
+            "--model",
+            "lama",
+            "--device",
+            "cpu",
+            "--image",
+            str(image_path),
+            "--mask",
+            str(mask_path),
+            "--output",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        except Exception as exc:
+            return None, type(exc).__name__
+        result = cv2.imread(str(output_path))
+        if result is None or result.shape[:2] != img.shape[:2]:
+            return None, "invalid_output"
+        return result, "ok"
+
+
 def clean_image(
     img: np.ndarray,
     gray: np.ndarray,
     det: Detection,
     templates: list[TemplateSpec] | None = None,
+    ocr_reader=None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
-    variants = [
-        ("glyph_tight", 8, 5, 3, 3, True),
-        ("glyph_medium", 12, 7, 4, 4, True),
-        ("glyph_strong", 14, 8, 6, 7, True),
-        ("tight", 8, 5, 4, 4, False),
-        ("medium", 12, 7, 5, 5, False),
-    ]
-    before = laplacian_var(gray)
+    high_contrast_mask = ENABLE_HIGH_CONTRAST_BOX_MASK and det.contrast_span >= REVIEW_CONTRAST_SPAN
+    if high_contrast_mask:
+        variants = [
+            ("edge_box_tight", 8, 5, 5, 5, False),
+            ("edge_box_medium", 12, 7, 7, 7, False),
+            ("glyph_medium", 12, 7, 4, 4, True),
+            ("glyph_strong", 14, 8, 6, 7, True),
+        ]
+    else:
+        variants = [
+            ("glyph_tight", 8, 5, 3, 3, True),
+            ("glyph_medium", 12, 7, 4, 4, True),
+            ("glyph_strong", 14, 8, 6, 7, True),
+            ("tight", 8, 5, 4, 4, False),
+            ("medium", 12, 7, 5, 5, False),
+        ]
     candidates = []
     first_mask = None
     first_area = 0.0
@@ -1010,7 +1312,8 @@ def clean_image(
         if first_mask is None:
             first_mask = mask
             first_area = area
-        if area > PILOT_MASK_AREA:
+        area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
+        if area > area_limit:
             continue
         for method_name, method in (("telea", cv2.INPAINT_TELEA), ("ns", cv2.INPAINT_NS)):
             candidate = cv2.inpaint(img, mask, radius, method)
@@ -1020,11 +1323,13 @@ def clean_image(
             residual = metrics["residual_score"]
             template_residual = metrics["template_residual_score"]
             artifact_penalty = max(0.0, 0.18 - sharpness_ratio) * 0.55
+            box_penalty = area * 2.0 if high_contrast_mask and not glyph else 0.0
             cost = (
                 min(1.0, residual)
                 + min(1.0, template_residual) * 0.18
                 + area * 10.0
                 + artifact_penalty
+                + box_penalty
             )
             score = -cost
             candidates.append((
@@ -1048,55 +1353,116 @@ def clean_image(
 
     candidates.sort(reverse=True, key=lambda item: item[0])
     _, residual, template_residual, ratio, area, name, best, mask, metrics = candidates[0]
-    if ratio < SHARPNESS_MIN_RATIO and residual >= CLEAN_VISIBLE_RESIDUAL_MAX:
-        return None, mask, {
-            "status": "needs_manual",
-            "reason": "blurry_and_residual",
-            "sharpness_ratio": round(ratio, 4),
-            "residual_score": round(residual, 4),
-            "template_residual_score": round(template_residual, 4),
-            "mask_area_pct": round(area * 100, 3),
-            "post_text_score": round(metrics["post_text_score"], 4),
-            "post_text_components": metrics["post_text_components"],
-        }
+
+    lama_reason = ""
+    if ENABLE_LAMA_ESCALATION and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
+        lama, lama_reason = run_lama_escalation(img, mask)
+        if lama is not None:
+            lgray = cv2.cvtColor(lama, cv2.COLOR_BGR2GRAY)
+            lratio = laplacian_var(lgray, mask) / max(laplacian_var(gray, mask), 1e-6)
+            lmetrics = residual_quality_metrics(lgray, det, templates)
+            lresidual = lmetrics["residual_score"]
+            ltemplate = lmetrics["template_residual_score"]
+            lcost = (
+                min(1.0, lresidual)
+                + min(1.0, ltemplate) * 0.18
+                + area * 10.0
+                + max(0.0, 0.18 - lratio) * 0.55
+            )
+            current_cost = -candidates[0][0]
+            if lcost < current_cost:
+                residual = lresidual
+                template_residual = ltemplate
+                ratio = lratio
+                metrics = lmetrics
+                best = lama
+                name = "lama"
+
+    best_gray = cv2.cvtColor(best, cv2.COLOR_BGR2GRAY)
+    post_count = post_clean_detection_count(best, best_gray, templates)
     broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
     position_confident = not det.template.startswith("prior:")
-    status = (
-        "cleaned"
-        if residual < CLEAN_VISIBLE_RESIDUAL_MAX and not broad_mask and ratio >= 0.30 and position_confident
-        else "needs_manual"
+    strict_pass = (
+        residual < CLEAN_STRICT_RESIDUAL_MAX
+        and template_residual < CLEAN_STRICT_TEMPLATE_MAX
+        and metrics["post_text_components"] <= 1
     )
+    hard_fail = residual >= CLEAN_FAIL_RESIDUAL_MIN or metrics["post_text_components"] >= CLEAN_FAIL_TEXT_COMPONENTS
+
+    reason = ""
+    gate = ""
+    ocr_meta: dict = {"ocr_checked": False, "ocr_watermark": None, "ocr_text": []}
+    if ratio < SHARPNESS_MIN_RATIO and residual >= CLEAN_FAIL_RESIDUAL_MIN:
+        status = "needs_manual"
+        reason = "blurry_and_residual"
+        gate = "fail_blurry_and_residual"
+    elif hard_fail:
+        status = "needs_manual"
+        reason = "residual_visible"
+        gate = "fail_residual_or_text_components"
+    elif strict_pass:
+        status = "cleaned"
+        gate = "pass_strict_post_clean_metrics"
+    else:
+        ocr_meta = cleaned_crop_ocr_check(best, det, ocr_reader)
+        if ocr_meta.get("ocr_checked"):
+            if ocr_meta.get("ocr_watermark"):
+                status = "needs_manual"
+                reason = "ocr_residual_text"
+                gate = "gray_zone_ocr_watermark"
+            else:
+                status = "cleaned"
+                gate = "gray_zone_ocr_clear"
+        elif post_count == 0 and residual < 0.35 and template_residual < 0.35 and metrics["post_text_components"] <= 2:
+            status = "cleaned"
+            gate = "gray_zone_post_detection_clear"
+        else:
+            status = "needs_manual"
+            reason = "gray_zone_needs_ocr"
+            gate = "gray_zone_no_ocr"
+
+    warnings = []
+    if ratio < 0.55:
+        warnings.append("low_sharpness_ratio")
+    if broad_mask:
+        warnings.append("broad_mask")
+    if not position_confident:
+        warnings.append("prior_detection_source")
+    if high_contrast_mask:
+        warnings.append("high_contrast_box_mask")
+
     meta = {
         "status": status,
         "strategy": name,
+        "gate": gate,
         "sharpness_ratio": round(ratio, 4),
         "residual_score": round(residual, 4),
         "template_residual_score": round(template_residual, 4),
         "mask_area_pct": round(area * 100, 3),
         "post_text_score": round(metrics["post_text_score"], 4),
         "post_text_components": metrics["post_text_components"],
+        "cleaned_detection_count": post_count,
+        "post_clean_detection_count": post_count,
+        "position_confident": position_confident,
+        "broad_mask": broad_mask,
     }
-    if status == "needs_manual":
-        if broad_mask:
-            meta["reason"] = "mask_area_review"
-        elif not position_confident:
-            meta["reason"] = "low_position_confidence"
-        elif ratio < 0.30:
-            meta["reason"] = "blurry"
-        else:
-            meta["reason"] = "residual_visible_or_wrong_detection"
-    if (
-        ratio < ARTIFACT_SHARPNESS_REVIEW_RATIO
-        and status == "cleaned"
-        and (residual >= 0.30 or metrics["post_text_components"] >= 2)
-    ):
-        status = "needs_manual"
-        meta["status"] = status
-        meta["reason"] = "artifact_risk"
-    elif ratio < 0.55:
-        meta["warning"] = "low_sharpness_ratio"
-    if residual >= CLEAN_VISIBLE_RESIDUAL_MAX:
-        meta["reason"] = "residual_visible_or_wrong_detection"
+    if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
+        meta.update({
+            "ocr_checked": ocr_meta.get("ocr_checked", False),
+            "ocr_watermark": ocr_meta.get("ocr_watermark"),
+            "ocr_text": ocr_meta.get("ocr_text", []),
+        })
+        if ocr_meta.get("ocr_error"):
+            meta["ocr_error"] = ocr_meta["ocr_error"]
+    if ENABLE_LAMA_ESCALATION and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
+        meta["lama_attempted"] = True
+        meta["lama_result"] = lama_reason or "not_selected"
+    elif ENABLE_LAMA_ESCALATION:
+        meta["lama_attempted"] = False
+    if reason:
+        meta["reason"] = reason
+    if warnings:
+        meta["warning"] = ";".join(warnings)
     return best, mask, meta
 
 
@@ -1105,6 +1471,7 @@ def clean_all_detections(
     gray: np.ndarray,
     detections: list[Detection],
     templates: list[TemplateSpec] | None = None,
+    ocr_reader=None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
     current = img.copy()
     combined_mask = np.zeros(gray.shape[:2], dtype=np.uint8)
@@ -1114,7 +1481,7 @@ def clean_all_detections(
 
     for det in detections:
         current_gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
-        cleaned, mask, meta = clean_image(current, current_gray, det, templates)
+        cleaned, mask, meta = clean_image(current, current_gray, det, templates, ocr_reader=ocr_reader)
         detail = {**meta, "detection": det.to_json()}
         details.append(detail)
         statuses.append(meta["status"])
@@ -1141,6 +1508,11 @@ def clean_all_detections(
         for item in details
         if isinstance(item.get("post_text_components"), int)
     ]
+    post_detection_counts = [
+        int(item["post_clean_detection_count"])
+        for item in details
+        if isinstance(item.get("post_clean_detection_count"), int)
+    ]
     combined_area = float(np.count_nonzero(combined_mask)) / max(1, combined_mask.size)
     warnings = [str(item.get("warning")) for item in details if item.get("warning")]
     strategies = [str(item.get("strategy")) for item in details if item.get("strategy")]
@@ -1156,7 +1528,9 @@ def clean_all_detections(
         "status": status,
         "strategy": "multi:" + ",".join(strategies[:4]) if len(strategies) > 1 else (strategies[0] if strategies else ""),
         "detection_count": len(detections),
-        "cleaned_detection_count": sum(1 for item in details if item.get("status") != "needs_manual"),
+        "auto_cleaned_detection_count": sum(1 for item in details if item.get("status") != "needs_manual"),
+        "cleaned_detection_count": max(post_detection_counts) if post_detection_counts else None,
+        "post_clean_detection_count": max(post_detection_counts) if post_detection_counts else None,
         "sharpness_ratio": round(min(sharpness_ratios), 4) if sharpness_ratios else 0.0,
         "residual_score": round(max(residuals), 4) if residuals else 0.0,
         "template_residual_score": round(max(template_residuals), 4) if template_residuals else 0.0,
@@ -1209,7 +1583,7 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
 .wrap{padding:18px}.card{background:white;border:1px solid #d9e0e8;border-radius:8px;margin:0 0 18px;overflow:hidden}
 .head{display:flex;justify-content:space-between;gap:16px;align-items:baseline;padding:12px 18px;border-bottom:1px solid #e3e8ef}
 .head h2{font-size:20px;margin:0}.meta{color:#667085;font-weight:600}
-.grid{display:grid;grid-template-columns:1fr 1fr 1fr}.pane{border-right:1px solid #dfe5ed;text-align:center;background:#fff}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr}.pane{border-right:1px solid #dfe5ed;text-align:center;background:#fff}
 .pane:last-child{border-right:0}.pane img{max-width:100%;height:auto;display:block;margin:0 auto}
 .label{border-top:1px solid #e8edf3;padding:9px 0;color:#667085;font-weight:600}
 @media(max-width:900px){.grid{grid-template-columns:1fr}.pane{border-right:0;border-bottom:1px solid #dfe5ed}}
@@ -1219,6 +1593,7 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
         original = html.escape(row.get("review_original", ""))
         mask = html.escape(row.get("review_mask", ""))
         cleaned = html.escape(row.get("review_cleaned", ""))
+        diff = html.escape(row.get("review_diff", ""))
         fname = html.escape(row["file"])
         meta_parts = [
             str(row.get("status")),
@@ -1237,6 +1612,7 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
     <div class="pane"><img src="{original}" alt="Original"><div class="label">Original</div></div>
     <div class="pane"><img src="{mask}" alt="Mask overlay"><div class="label">Mask overlay</div></div>
     <div class="pane"><img src="{cleaned}" alt="Result"><div class="label">Result</div></div>
+    <div class="pane"><img src="{diff}" alt="Difference"><div class="label">Diff x3</div></div>
   </div>
 </section>""")
     doc = f"""<!doctype html>
@@ -1262,6 +1638,16 @@ def write_mask_overlay(path: Path, source: np.ndarray, mask: np.ndarray | None) 
         contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
     copy_or_write_image(path, overlay)
+
+
+def write_diff_image(path: Path, original: np.ndarray, cleaned: np.ndarray | None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if cleaned is None:
+        diff = np.zeros_like(original)
+    else:
+        diff = cv2.absdiff(original, cleaned)
+        diff = np.uint8(np.clip(diff.astype(np.float32) * 3.0, 0, 255))
+    copy_or_write_image(path, diff)
 
 
 def manifest_writer(path: Path):
@@ -1355,13 +1741,16 @@ def process_file(
             write_blank_mask(mask_path, img)
             overlay_path = out_dir / "overlays" / path.name
             write_mask_overlay(overlay_path, img, None)
+            diff_path = out_dir / "diffs" / path.name
+            write_diff_image(diff_path, img, None)
             entry["review_original"] = f"originals/{path.name}"
             entry["review_mask"] = f"overlays/{path.name}"
             entry["mask_binary"] = str(mask_path)
             entry["review_cleaned"] = f"originals/{path.name}"
+            entry["review_diff"] = f"diffs/{path.name}"
         return entry
     targets = cleaning_targets(detections)
-    cleaned, mask, meta = clean_all_detections(img, gray, targets, templates)
+    cleaned, mask, meta = clean_all_detections(img, gray, targets, templates, ocr_reader=ocr_reader)
     meta["detected_count"] = len(detections)
     entry = {
         "file": path.name,
@@ -1398,6 +1787,9 @@ def process_file(
             entry["review_cleaned"] = f"originals/{path.name}"
         else:
             entry["review_cleaned"] = f"originals/{path.name}"
+        diff_path = out_dir / "diffs" / path.name
+        write_diff_image(diff_path, img, cleaned)
+        entry["review_diff"] = f"diffs/{path.name}"
     return entry
 
 
