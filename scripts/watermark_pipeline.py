@@ -23,6 +23,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
 
@@ -94,7 +95,11 @@ HIGH_CONTRAST_SPAN = 200.0
 REVIEW_CONTRAST_SPAN = 170.0
 FALLBACK_CONTRAST_SPAN = 150.0
 LINE_DOMINANCE_MAX = 0.72
-OCR_WATERMARK_RE = re.compile(r"(sunsky|sunsk|sursky|sky.*onlin|onlin.*com|onlinecom|olne.*com|alinec|sun.*com)")
+OCR_CANONICAL = "sunskyonlinecom"
+OCR_MATCH_MIN = 0.74
+OCR_DIRECT_MIN = 0.78
+OCR_CROP_MIN = 0.76
+OCR_LOW_CONF_DIRECT_MIN = 0.88
 ENABLE_BRIGHT_RECALL = True
 ENABLE_HIGH_CONTRAST_BOX_MASK = True
 ENABLE_LAMA_ESCALATION = True
@@ -119,9 +124,15 @@ class Detection:
     contrast_span: float = 0.0
     line_dominance: float = 0.0
     confidence: float = 0.0
+    ocr_text: str = ""
+    ocr_confidence: float = 0.0
+    ocr_watermark_score: float = 0.0
+    roi_class: str = ""
+    product_overlap: float = 0.0
+    layout_risk: str = ""
 
     def to_json(self) -> dict:
-        return {
+        payload = {
             "x": self.x,
             "y": self.y,
             "w": self.w,
@@ -138,6 +149,16 @@ class Detection:
             "line_dominance": round(self.line_dominance, 3),
             "confidence": round(self.confidence, 4),
         }
+        if self.ocr_text:
+            payload["ocr_text"] = self.ocr_text
+            payload["ocr_confidence"] = round(self.ocr_confidence, 4)
+            payload["ocr_watermark_score"] = round(self.ocr_watermark_score, 4)
+        if self.roi_class:
+            payload["roi_class"] = self.roi_class
+            payload["product_overlap"] = round(self.product_overlap, 4)
+        if self.layout_risk:
+            payload["layout_risk"] = self.layout_risk
+        return payload
 
 
 @dataclass(frozen=True)
@@ -486,6 +507,123 @@ def band_features(gray: np.ndarray, box: dict) -> dict:
     return {"contrast_span": contrast_span, "line_dominance": float(line_dominance)}
 
 
+def image_layout_features(gray: np.ndarray, img: np.ndarray | None = None) -> dict:
+    """Detect dense instruction-sheet layouts that should not use weak priors."""
+    h, w = gray.shape[:2]
+    scale = min(1.0, 720.0 / max(h, w, 1))
+    small = gray
+    if scale < 1.0:
+        small = cv2.resize(gray, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    sh, sw = small.shape[:2]
+    edges = cv2.Canny(small, 60, 150)
+    edge_density = float(np.mean(edges > 0))
+
+    binary = (small < 210).astype(np.uint8) * 255
+    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    small_components = 0
+    long_horizontal = 0
+    long_vertical = 0
+    for idx in range(1, count):
+        _, _, ww, hh, area = stats[idx]
+        if area < 3:
+            continue
+        if area <= max(18, small.size * 0.0025) and ww <= sw * 0.24 and hh <= sh * 0.10:
+            small_components += 1
+        if ww >= sw * 0.28 and hh <= max(5, sh * 0.015):
+            long_horizontal += 1
+        if hh >= sh * 0.22 and ww <= max(5, sw * 0.015):
+            long_vertical += 1
+
+    row_edge_ratio = np.mean(edges > 0, axis=1) if edges.size else np.array([], dtype=np.float32)
+    col_edge_ratio = np.mean(edges > 0, axis=0) if edges.size else np.array([], dtype=np.float32)
+    strong_edge_rows = int(np.count_nonzero(row_edge_ratio > 0.42))
+    strong_edge_cols = int(np.count_nonzero(col_edge_ratio > 0.42))
+    panel_line_score = min(1.0, (long_horizontal + long_vertical + strong_edge_rows + strong_edge_cols) / 16.0)
+    text_dense_score = min(1.0, small_components / 170.0) * 0.62 + min(1.0, edge_density / 0.085) * 0.22 + panel_line_score * 0.16
+    text_dense = text_dense_score >= 0.62 or (small_components >= 120 and panel_line_score >= 0.25)
+    step_layout = panel_line_score >= 0.42 and small_components >= 75
+    return {
+        "edge_density": edge_density,
+        "small_component_count": int(small_components),
+        "panel_line_score": float(panel_line_score),
+        "text_dense_score": float(text_dense_score),
+        "text_dense_layout": bool(text_dense),
+        "step_layout": bool(step_layout),
+    }
+
+
+def estimate_product_overlap_v13(gray: np.ndarray, box: dict) -> dict:
+    """Classify the watermark footprint using interior product signals.
+
+    This mirrors the useful part of the V13 design: routing should come from
+    what is under the watermark, not from detector provenance. High product
+    overlap means broad white/box fills are unsafe.
+    """
+    img_h, img_w = gray.shape[:2]
+    x = max(0, int(box["x"]))
+    y = max(0, int(box["y"]))
+    w = max(1, min(int(box["w"]), img_w - x))
+    h = max(1, min(int(box["h"]), img_h - y))
+    roi = gray[y:y + h, x:x + w]
+    if roi.size == 0:
+        return {
+            "roi_class": "unknown",
+            "product_overlap": 0.0,
+            "roi_edge_density": 0.0,
+            "roi_dark_ratio": 0.0,
+            "roi_nonwhite_ratio": 0.0,
+            "protected_text_risk": False,
+        }
+
+    mean_luma = float(np.mean(roi))
+    std_luma = float(np.std(roi))
+    dark_ratio = float(np.mean(roi < 95))
+    nonwhite_ratio = float(np.mean(roi < 238))
+    white_ratio = float(np.mean(roi > 245))
+    edges = cv2.Canny(roi, 55, 140)
+    edge_density = float(np.mean(edges > 0))
+    features = band_features(gray, box)
+    text_score, text_components = text_likeness(gray, box)
+
+    product_overlap = min(1.0, nonwhite_ratio * 0.48 + dark_ratio * 0.28 + min(1.0, edge_density / 0.16) * 0.18 + min(1.0, std_luma / 80.0) * 0.06)
+    protected_text_risk = bool(text_components >= 12 and features["contrast_span"] >= 120 and edge_density >= 0.065)
+
+    if white_ratio >= 0.86 and edge_density < 0.030 and std_luma < 22:
+        roi_class = "plain_white"
+    elif mean_luma > 218 and edge_density < 0.065 and dark_ratio < 0.08:
+        roi_class = "near_white"
+    elif dark_ratio >= 0.38 or mean_luma < 120:
+        roi_class = "dark_product_surface"
+    elif features["line_dominance"] >= 0.46 and (dark_ratio > 0.20 or edge_density > 0.08):
+        roi_class = "thin_flex_cable"
+    elif protected_text_risk:
+        roi_class = "text_or_label_area"
+    elif edge_density >= 0.135 or features["contrast_span"] >= REVIEW_CONTRAST_SPAN:
+        roi_class = "complex_product_detail"
+    elif edge_density < 0.055 and std_luma < 34:
+        roi_class = "low_texture_background"
+    else:
+        roi_class = "simple_product_surface" if product_overlap >= 0.28 else "unknown"
+
+    return {
+        "roi_class": roi_class,
+        "product_overlap": float(product_overlap),
+        "roi_edge_density": edge_density,
+        "roi_dark_ratio": dark_ratio,
+        "roi_nonwhite_ratio": nonwhite_ratio,
+        "protected_text_risk": protected_text_risk,
+    }
+
+
+def annotate_detection_context(det: Detection, gray: np.ndarray, layout: dict | None = None) -> Detection:
+    roi_meta = estimate_product_overlap_v13(gray, det.mark_box)
+    det.roi_class = str(roi_meta["roi_class"])
+    det.product_overlap = float(roi_meta["product_overlap"])
+    if layout and layout.get("text_dense_layout"):
+        det.layout_risk = "step_layout" if layout.get("step_layout") else "text_dense_layout"
+    return det
+
+
 def is_fallback_template(template_name: str) -> bool:
     return ":" not in template_name and not template_name.startswith("watermark-template")
 
@@ -636,12 +774,80 @@ def nms(detections: list[Detection], img_w: int, img_h: int, limit: int) -> list
 
 
 def normalize_ocr_text(text: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", text.lower())
+    norm = re.sub(r"[^a-z0-9]", "", text.lower())
+    return norm.translate(str.maketrans({
+        "0": "o",
+        "1": "l",
+        "3": "e",
+        "5": "s",
+        "7": "t",
+    }))
 
 
-def ocr_text_matches_watermark(text: str) -> bool:
+def _window_similarity(norm: str, token: str) -> float:
+    if not norm or not token:
+        return 0.0
+    if token in norm:
+        return 1.0
+    tlen = len(token)
+    best = 0.0
+    min_len = max(2, tlen - 1)
+    max_len = min(len(norm), tlen + 2)
+    for size in range(min_len, max_len + 1):
+        for start in range(0, len(norm) - size + 1):
+            best = max(best, SequenceMatcher(None, norm[start:start + size], token).ratio())
+            if best >= 0.98:
+                return best
+    return best
+
+
+def watermark_text_score(text: str) -> float:
+    """Score whether OCR text is specifically the Sunsky watermark domain.
+
+    The previous matcher accepted broad fragments such as "online...com" or
+    "alinec", which pulled clean product-detail images into watermarked-only
+    pilots. This score requires the domain structure: a Sunsky/sky-like left
+    token plus an online/com-like right token. Fuzzy matching remains because
+    low-opacity watermark OCR often reads "sunsky" as "sumsky", "sursky", or
+    drops the leading "sun".
+    """
     norm = normalize_ocr_text(text)
-    return bool(OCR_WATERMARK_RE.search(norm))
+    if len(norm) < 7:
+        return 0.0
+
+    full = SequenceMatcher(None, norm, OCR_CANONICAL).ratio()
+    sunsky = max(
+        _window_similarity(norm, "sunsky"),
+        _window_similarity(norm, "sursky"),
+        _window_similarity(norm, "sumsky"),
+        _window_similarity(norm, "sunsk"),
+    )
+    sky = 1.0 if "sky" in norm else _window_similarity(norm, "sky")
+    online = max(
+        _window_similarity(norm, "online"),
+        _window_similarity(norm, "onlne"),
+        _window_similarity(norm, "oniine"),
+        _window_similarity(norm, "onlin"),
+    )
+    com = max(_window_similarity(norm, "com"), 0.72 if norm.endswith("co") or "co" in norm[-4:] else 0.0)
+
+    if sunsky >= 0.68 and online >= 0.70:
+        return float(min(1.0, sunsky * 0.42 + online * 0.40 + com * 0.12 + full * 0.06))
+    if sky >= 0.95 and online >= 0.76 and com >= 0.60:
+        return float(min(0.86, 0.30 * sky + 0.48 * online + 0.16 * com + 0.06 * full))
+    if full >= 0.80 and (sunsky >= 0.58 or sky >= 0.90) and online >= 0.62:
+        return float(min(0.90, full))
+    return 0.0
+
+
+def ocr_text_matches_watermark(text: str, min_score: float = OCR_MATCH_MIN) -> bool:
+    return watermark_text_score(text) >= min_score
+
+
+def ocr_confidence_pass(score: float, conf: float, *, crop: bool = False) -> bool:
+    if crop:
+        return score >= OCR_CROP_MIN and (conf >= 0.14 or score >= OCR_LOW_CONF_DIRECT_MIN)
+    return score >= OCR_DIRECT_MIN and (conf >= 0.18 or score >= OCR_LOW_CONF_DIRECT_MIN)
 
 
 def load_ocr_reader(enabled: bool):
@@ -675,7 +881,10 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
         return []
 
     for box, text, conf in results:
-        if not ocr_text_matches_watermark(str(text)):
+        raw_text = str(text)
+        text_score_match = watermark_text_score(raw_text)
+        conf = float(conf)
+        if not ocr_confidence_pass(text_score_match, conf, crop=False):
             continue
         pts = np.array(box, dtype=np.float32)
         x1 = float(np.min(pts[:, 0]))
@@ -690,7 +899,7 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
             continue
         text_score, text_components = text_likeness(gray, mark)
         features = band_features(gray, mark)
-        ocr_score = max(0.75, float(conf))
+        ocr_score = max(0.75, text_score_match * 0.74 + min(1.0, conf) * 0.26)
         confidence = candidate_confidence(
             ocr_score,
             1.0,
@@ -703,12 +912,15 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
         detections.append(Detection(
             x=mark["x"], y=mark["y"], w=mark["w"], h=mark["h"],
             score=ocr_score, verify_score=1.0,
-            template=f"ocr:{str(text)[:48]}", scale=1.0,
+            template=f"ocr:{raw_text[:48]}", scale=1.0,
             mark_box=mark, mask_area_pct=area_pct,
             text_score=max(text_score, 0.95), text_components=max(text_components, 12),
             contrast_span=features["contrast_span"],
             line_dominance=features["line_dominance"],
             confidence=confidence,
+            ocr_text=raw_text,
+            ocr_confidence=conf,
+            ocr_watermark_score=text_score_match,
         ))
     return detections
 
@@ -736,17 +948,29 @@ def ocr_image_watermark_check(img: np.ndarray, reader, *, canvas_size: int = 960
         }
     texts: list[str] = []
     watermark = False
+    best_score = 0.0
+    best_text = ""
+    best_conf = 0.0
     for _, text, conf in results:
         text = str(text)
         if not text.strip():
             continue
-        texts.append(f"{text}:{float(conf):.2f}")
-        if ocr_text_matches_watermark(text):
+        conf = float(conf)
+        score = watermark_text_score(text)
+        texts.append(f"{text}:{conf:.2f}:{score:.2f}")
+        if score > best_score:
+            best_score = score
+            best_text = text
+            best_conf = conf
+        if ocr_confidence_pass(score, conf, crop=True):
             watermark = True
     return {
         "ocr_checked": True,
         "ocr_watermark": watermark,
         "ocr_text": texts[:6],
+        "ocr_best_text": best_text,
+        "ocr_best_confidence": best_conf,
+        "ocr_watermark_score": best_score,
     }
 
 
@@ -755,6 +979,7 @@ def confirm_watermark_presence(
     gray: np.ndarray,
     detections: list[Detection],
     ocr_reader=None,
+    layout: dict | None = None,
 ) -> dict:
     """Confirm that a detection is likely the Sunsky watermark, not a product detail.
 
@@ -765,26 +990,48 @@ def confirm_watermark_presence(
     if not detections:
         return {"presence_confirmed": False, "presence_reason": "no_detection"}
 
-    if any(det.template.startswith("ocr:") for det in detections):
-        return {"presence_confirmed": True, "presence_reason": "ocr_detection"}
+    layout = layout or image_layout_features(gray, img)
+    ocr_detections = [det for det in detections if det.template.startswith("ocr:")]
+    if ocr_detections:
+        best_ocr = max(ocr_detections, key=lambda det: (det.ocr_watermark_score, det.ocr_confidence, det.confidence))
+        if ocr_confidence_pass(best_ocr.ocr_watermark_score, best_ocr.ocr_confidence, crop=False):
+            return {
+                "presence_confirmed": True,
+                "presence_reason": "ocr_detection",
+                "presence_score": round(best_ocr.ocr_watermark_score, 4),
+                "presence_ocr_text": [f"{best_ocr.ocr_text}:{best_ocr.ocr_confidence:.2f}:{best_ocr.ocr_watermark_score:.2f}"],
+            }
 
     if ocr_reader is not None:
         checked = []
+        best_crop_score = 0.0
+        best_crop_text = ""
+        best_crop_conf = 0.0
         for det in detections[:3]:
             pad_x = max(10, int(round(det.mark_box["w"] * 0.16)))
             pad_y = max(8, int(round(det.mark_box["h"] * 0.90)))
             crop = padded_crop(img, det.mark_box, pad_x, pad_y)
             ocr_meta = ocr_image_watermark_check(crop, ocr_reader, canvas_size=760, mag_ratio=2.0)
             checked.extend(ocr_meta.get("ocr_text", []))
+            if float(ocr_meta.get("ocr_watermark_score") or 0.0) > best_crop_score:
+                best_crop_score = float(ocr_meta.get("ocr_watermark_score") or 0.0)
+                best_crop_text = str(ocr_meta.get("ocr_best_text") or "")
+                best_crop_conf = float(ocr_meta.get("ocr_best_confidence") or 0.0)
             if ocr_meta.get("ocr_watermark"):
                 return {
                     "presence_confirmed": True,
                     "presence_reason": "ocr_crop_confirmed",
+                    "presence_score": round(best_crop_score, 4),
+                    "presence_best_text": best_crop_text,
+                    "presence_best_confidence": round(best_crop_conf, 4),
                     "presence_ocr_text": checked[:8],
                 }
         return {
             "presence_confirmed": False,
             "presence_reason": "ocr_crop_not_confirmed",
+            "presence_score": round(best_crop_score, 4),
+            "presence_best_text": best_crop_text,
+            "presence_best_confidence": round(best_crop_conf, 4),
             "presence_ocr_text": checked[:8],
         }
 
@@ -799,11 +1046,18 @@ def confirm_watermark_presence(
         and best.contrast_span <= REVIEW_CONTRAST_SPAN
         and best.line_dominance <= 0.45
     )
+    if layout.get("text_dense_layout") and not best.template.startswith("watermark-template"):
+        return {
+            "presence_confirmed": False,
+            "presence_reason": "text_dense_layout_requires_direct_evidence",
+            "presence_score": 0.0,
+        }
     if strong_template:
-        return {"presence_confirmed": True, "presence_reason": "strong_template_no_ocr"}
+        return {"presence_confirmed": True, "presence_reason": "strong_template_no_ocr", "presence_score": round(best.confidence, 4)}
     return {
         "presence_confirmed": False,
         "presence_reason": "weak_or_prior_detection_without_ocr",
+        "presence_score": round(best.confidence, 4),
     }
 
 
@@ -1048,9 +1302,11 @@ def detect_watermark(
     preset_name: str,
     img: np.ndarray | None = None,
     ocr_reader=None,
+    layout: dict | None = None,
 ) -> list[Detection]:
     preset = PRESETS[preset_name]
     img_h, img_w = gray.shape[:2]
+    layout = layout or image_layout_features(gray, img)
     down = 1.0
     scan = gray
     if max(img_w, img_h) > preset["downscale_max"]:
@@ -1062,7 +1318,8 @@ def detect_watermark(
     found: list[Detection] = []
     if img is not None and ocr_reader is not None:
         found.extend(ocr_watermark_detections(img, gray, ocr_reader))
-    found.extend(prior_text_band_detections(gray, img=img))
+    if not layout.get("text_dense_layout"):
+        found.extend(prior_text_band_detections(gray, img=img))
     for spec in templates:
         tpl_name = spec.name
         tpl = spec.image
@@ -1129,8 +1386,10 @@ def detect_watermark(
                     line_dominance=features["line_dominance"],
                     confidence=confidence,
                 ))
-    if ENABLE_BRIGHT_RECALL and not found and ocr_reader is not None:
+    if ENABLE_BRIGHT_RECALL and not found and ocr_reader is not None and not layout.get("text_dense_layout"):
         found.extend(bright_background_text_band_detections(gray, img=img, ocr_reader=ocr_reader))
+    for det in found:
+        annotate_detection_context(det, gray, layout)
     return nms(found, img_w, img_h, int(preset["max_detections"]))
 
 
@@ -1389,13 +1648,75 @@ def detect_rectangular_band_visibility(original: np.ndarray, candidate: np.ndarr
     }
 
 
+def detect_product_damage_v13(original: np.ndarray, candidate: np.ndarray, mask: np.ndarray | None, det: Detection) -> dict:
+    if mask is None or np.count_nonzero(mask) == 0:
+        return {
+            "product_gate_fail": False,
+            "product_color_delta": 0.0,
+            "product_edge_retention": 1.0,
+            "product_blob_score": 0.0,
+            "product_changed_area_ratio": 0.0,
+        }
+    if det.product_overlap < 0.30 and det.roi_class not in {"dark_product_surface", "thin_flex_cable", "complex_product_detail", "text_or_label_area"}:
+        return {
+            "product_gate_fail": False,
+            "product_color_delta": 0.0,
+            "product_edge_retention": 1.0,
+            "product_blob_score": 0.0,
+            "product_changed_area_ratio": 0.0,
+        }
+
+    orig_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    cand_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+    diff_gray = cv2.absdiff(orig_gray, cand_gray)
+    product_mask = ((orig_gray < 235) | (cv2.Canny(orig_gray, 55, 150) > 0)).astype(np.uint8) * 255
+    protect = cv2.bitwise_and(product_mask, cv2.dilate(mask, np.ones((5, 9), np.uint8), iterations=1))
+    changed = cv2.bitwise_and(((diff_gray > 10).astype(np.uint8) * 255), protect)
+    changed_count = int(np.count_nonzero(changed))
+    if changed_count == 0:
+        return {
+            "product_gate_fail": False,
+            "product_color_delta": 0.0,
+            "product_edge_retention": 1.0,
+            "product_blob_score": 0.0,
+            "product_changed_area_ratio": 0.0,
+        }
+
+    orig_edges = cv2.bitwise_and(cv2.Canny(orig_gray, 55, 150), protect)
+    cand_edges = cv2.bitwise_and(cv2.Canny(cand_gray, 55, 150), protect)
+    edge_retention = float(np.count_nonzero(cv2.bitwise_and(orig_edges, cand_edges)) / max(1, np.count_nonzero(orig_edges)))
+    product_color_delta = float(np.mean(diff_gray[changed > 0]))
+    orig_i = orig_gray.astype(np.int16)
+    cand_i = cand_gray.astype(np.int16)
+    dark_surface = orig_i < 110
+    bright_blob = np.logical_and.reduce((changed > 0, dark_surface, cand_i > orig_i + 42))
+    dark_blob = np.logical_and(changed > 0, cand_i + 42 < orig_i)
+    blob_score = float((np.count_nonzero(bright_blob) + np.count_nonzero(dark_blob)) / max(1, changed_count))
+    changed_area_ratio = float(changed_count / max(1, np.count_nonzero(mask)))
+    contour_break = max(0.0, 1.0 - edge_retention)
+    fail = (
+        (det.roi_class in {"dark_product_surface", "thin_flex_cable"} and blob_score > 0.10)
+        or (det.product_overlap >= 0.45 and product_color_delta > 34.0 and edge_retention < 0.72)
+        or (det.product_overlap >= 0.55 and contour_break > 0.42 and changed_area_ratio > 0.38)
+    )
+    return {
+        "product_gate_fail": bool(fail),
+        "product_color_delta": product_color_delta,
+        "product_edge_retention": edge_retention,
+        "product_blob_score": blob_score,
+        "product_changed_area_ratio": changed_area_ratio,
+    }
+
+
 def final_publish_gate(
     metrics: dict,
     post_count: int | None,
     ocr_meta: dict,
     dot_metrics: dict,
     band_metrics: dict,
+    product_metrics: dict | None = None,
 ) -> dict:
+    product_metrics = product_metrics or {"product_gate_fail": False}
     required = ["residual_score", "template_residual_score", "post_text_score", "post_text_components"]
     metrics_valid = all(isinstance(metrics.get(key), (int, float)) for key in required)
     residual_pass = (
@@ -1408,6 +1729,7 @@ def final_publish_gate(
     )
     dot_pass = not bool(dot_metrics.get("dot_chain_fail"))
     band_pass = not bool(band_metrics.get("band_gate_fail"))
+    product_pass = not bool(product_metrics.get("product_gate_fail"))
     reject_reasons = []
     if not metrics_valid:
         reject_reasons.append("missing_required_qa_metric")
@@ -1417,7 +1739,9 @@ def final_publish_gate(
         reject_reasons.append("dot_chain_residual")
     if not band_pass:
         reject_reasons.append("visible_rectangular_band")
-    publish_ok = metrics_valid and residual_pass and dot_pass and band_pass
+    if not product_pass:
+        reject_reasons.append("product_damage")
+    publish_ok = metrics_valid and residual_pass and dot_pass and band_pass and product_pass
     return {
         "publish_ok": bool(publish_ok),
         "status": "cleaned" if publish_ok else "needs_manual",
@@ -1426,6 +1750,7 @@ def final_publish_gate(
         "residual_pass": bool(residual_pass),
         "dot_chain_pass": bool(dot_pass),
         "band_pass": bool(band_pass),
+        "product_gate_pass": bool(product_pass),
     }
 
 
@@ -1530,7 +1855,18 @@ def clean_image(
     ocr_reader=None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
     high_contrast_mask = ENABLE_HIGH_CONTRAST_BOX_MASK and det.contrast_span >= REVIEW_CONTRAST_SPAN
-    if high_contrast_mask:
+    risky_product_roi = (
+        det.product_overlap >= 0.42
+        or det.roi_class in {"dark_product_surface", "thin_flex_cable", "complex_product_detail", "text_or_label_area"}
+        or det.layout_risk
+    )
+    if risky_product_roi:
+        variants = [
+            ("glyph_tight", 8, 5, 2, 3, True),
+            ("glyph_medium", 11, 6, 3, 4, True),
+            ("glyph_strong", 13, 7, 4, 5, True),
+        ]
+    elif high_contrast_mask:
         variants = [
             ("edge_box_tight", 8, 5, 5, 5, False),
             ("edge_box_medium", 12, 7, 7, 7, False),
@@ -1605,7 +1941,8 @@ def clean_image(
         cocr_meta = cleaned_crop_ocr_check(cbest, det, ocr_reader)
         cdot_metrics = residual_component_metrics(cgray, det)
         cband_metrics = detect_rectangular_band_visibility(img, cbest, cmask)
-        cgate_meta = final_publish_gate(cmetrics, cpost_count, cocr_meta, cdot_metrics, cband_metrics)
+        cproduct_metrics = detect_product_damage_v13(img, cbest, cmask, det)
+        cgate_meta = final_publish_gate(cmetrics, cpost_count, cocr_meta, cdot_metrics, cband_metrics, cproduct_metrics)
         if cgate_meta["publish_ok"]:
             selected = cand
             selected_eval = {
@@ -1614,6 +1951,7 @@ def clean_image(
                 "ocr_meta": cocr_meta,
                 "dot_metrics": cdot_metrics,
                 "band_metrics": cband_metrics,
+                "product_metrics": cproduct_metrics,
                 "gate_meta": cgate_meta,
             }
             break
@@ -1651,6 +1989,7 @@ def clean_image(
         ocr_meta = selected_eval["ocr_meta"]
         dot_metrics = selected_eval["dot_metrics"]
         band_metrics = selected_eval["band_metrics"]
+        product_metrics = selected_eval["product_metrics"]
         gate_meta = selected_eval["gate_meta"]
     else:
         best_gray = cv2.cvtColor(best, cv2.COLOR_BGR2GRAY)
@@ -1658,7 +1997,8 @@ def clean_image(
         ocr_meta = cleaned_crop_ocr_check(best, det, ocr_reader)
         dot_metrics = residual_component_metrics(best_gray, det)
         band_metrics = detect_rectangular_band_visibility(img, best, mask)
-        gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics)
+        product_metrics = detect_product_damage_v13(img, best, mask, det)
+        gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics)
     broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
     position_confident = not det.template.startswith("prior:")
 
@@ -1678,12 +2018,14 @@ def clean_image(
             cleanup_ocr_meta = cleaned_crop_ocr_check(cleanup, det, ocr_reader)
             cleanup_dot_metrics = residual_component_metrics(cgray, det)
             cleanup_band_metrics = detect_rectangular_band_visibility(img, cleanup, mask)
+            cleanup_product_metrics = detect_product_damage_v13(img, cleanup, mask, det)
             cleanup_gate = final_publish_gate(
                 cleanup_metrics,
                 cleanup_post_count,
                 cleanup_ocr_meta,
                 cleanup_dot_metrics,
                 cleanup_band_metrics,
+                cleanup_product_metrics,
             )
             if cleanup_gate["publish_ok"] or (
                 cleanup_metrics["residual_score"] < metrics["residual_score"]
@@ -1698,6 +2040,7 @@ def clean_image(
                 ocr_meta = cleanup_ocr_meta
                 dot_metrics = cleanup_dot_metrics
                 band_metrics = cleanup_band_metrics
+                product_metrics = cleanup_product_metrics
                 gate_meta = cleanup_gate
                 name = f"{name}_micro_cleanup"
 
@@ -1717,6 +2060,8 @@ def clean_image(
         warnings.append("prior_detection_source")
     if high_contrast_mask:
         warnings.append("high_contrast_box_mask")
+    if risky_product_roi:
+        warnings.append(f"risky_roi:{det.roi_class or 'unknown'}")
 
     meta = {
         "status": status,
@@ -1732,10 +2077,14 @@ def clean_image(
         "post_clean_detection_count": post_count,
         "position_confident": position_confident,
         "broad_mask": broad_mask,
+        "roi_class": det.roi_class,
+        "product_overlap": round(det.product_overlap, 4),
+        "layout_risk": det.layout_risk,
         "metrics_valid": gate_meta["metrics_valid"],
         "residual_pass": gate_meta["residual_pass"],
         "dot_chain_pass": gate_meta["dot_chain_pass"],
         "band_pass": gate_meta["band_pass"],
+        "product_gate_pass": gate_meta["product_gate_pass"],
         "dot_chain_score": round(float(dot_metrics["dot_chain_score"]), 4),
         "dot_component_count": dot_metrics["dot_component_count"],
         "dot_horizontal_span": round(float(dot_metrics["dot_horizontal_span"]), 4),
@@ -1743,6 +2092,10 @@ def clean_image(
         "visible_band_score": round(float(band_metrics["visible_band_score"]), 4),
         "band_luma_delta": round(float(band_metrics["band_luma_delta"]), 4),
         "band_edge_box": round(float(band_metrics["band_edge_box"]), 4),
+        "product_color_delta": round(float(product_metrics["product_color_delta"]), 4),
+        "product_edge_retention": round(float(product_metrics["product_edge_retention"]), 4),
+        "product_blob_score": round(float(product_metrics["product_blob_score"]), 4),
+        "product_changed_area_ratio": round(float(product_metrics["product_changed_area_ratio"]), 4),
         "cleanup_attempted": cleanup_attempted,
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
@@ -1903,6 +2256,10 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
             meta_parts.append(f"visible {row.get('residual_score')}")
         if "template_residual_score" in row:
             meta_parts.append(f"template {row.get('template_residual_score')}")
+        if row.get("presence_reason"):
+            meta_parts.append(str(row.get("presence_reason")))
+        if row.get("detection", {}).get("roi_class"):
+            meta_parts.append(f"roi {row['detection']['roi_class']}")
         meta = html.escape(" | ".join(part for part in meta_parts if part))
         body.append(f"""
 <section class="card">
@@ -1988,9 +2345,12 @@ def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
             ("residual_score", "visible"),
             ("template_residual_score", "template"),
             ("post_text_components", "components"),
+            ("presence_score", "presence"),
         ]:
             if key in row:
                 metrics.append(f"{label} {row.get(key)}")
+        if row.get("detection", {}).get("roi_class"):
+            metrics.append(f"roi {row['detection']['roi_class']}")
         draw.text((margin, 24), f"#{idx} {filename}", fill="#111827", font=title_font)
         draw.text(
             (margin, 60),
@@ -2201,9 +2561,10 @@ def process_file(
     if img is None:
         return {"file": path.name, "status": "needs_manual", "reason": "read_failed"}
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    detections = detect_watermark(gray, templates, preset, img=img, ocr_reader=ocr_reader)
+    layout = image_layout_features(gray, img)
+    detections = detect_watermark(gray, templates, preset, img=img, ocr_reader=ocr_reader, layout=layout)
     if not detections:
-        entry = {"file": path.name, "status": "no_watermark"}
+        entry = {"file": path.name, "status": "no_watermark", "layout": layout}
         if review:
             original_path = out_dir / "originals" / path.name
             original_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2220,9 +2581,9 @@ def process_file(
             entry["review_cleaned"] = f"originals/{path.name}"
             entry["review_diff"] = f"diffs/{path.name}"
         return entry
-    presence = confirm_watermark_presence(img, gray, detections, ocr_reader)
+    presence = confirm_watermark_presence(img, gray, detections, ocr_reader, layout=layout)
     if require_presence_confirmed and not presence.get("presence_confirmed"):
-        entry = {"file": path.name, "status": "no_watermark", **presence}
+        entry = {"file": path.name, "status": "no_watermark", **presence, "layout": layout}
         if review:
             original_path = out_dir / "originals" / path.name
             original_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2246,6 +2607,7 @@ def process_file(
         "file": path.name,
         **meta,
         **presence,
+        "layout": layout,
         "detection": detections[0].to_json(),
         "detections": [det.to_json() for det in detections],
     }
@@ -2393,7 +2755,15 @@ def cmd_process(args: argparse.Namespace) -> None:
     ][:int(limit) if limit != math.inf else None]
 
     def run_master(row: dict) -> dict:
-        return process_file(assets / row["file"], templates, args.preset, out_dir, review=False, ocr_reader=ocr_reader)
+        return process_file(
+            assets / row["file"],
+            templates,
+            args.preset,
+            out_dir,
+            review=False,
+            ocr_reader=ocr_reader,
+            require_presence_confirmed=True,
+        )
 
     done = 0
     if args.workers <= 1:
