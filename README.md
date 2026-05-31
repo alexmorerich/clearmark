@@ -1,7 +1,20 @@
 # ClearMark
 
-ClearMark removes authorized `sunsky-online.com` watermarks from product-image
-copies while keeping the source asset folder untouched.
+ClearMark is a local Sunsky watermark detection, removal, and visual-review
+pipeline for authorized product-image copies. It is built for the
+`sunsky-online.com` watermark pattern in the B2B product asset library.
+
+The project is intentionally conservative:
+
+```text
+detect accurately -> repair narrowly -> publish only if post-clean evidence is clean
+```
+
+The source asset folder is never modified. Every cleaned image, failed attempt,
+mask, HTML report, PDF, manifest, and Telegram attachment is generated output
+and must stay out of Git.
+
+## Paths
 
 Source assets:
 
@@ -15,81 +28,262 @@ Project root:
 /Users/alexkou/Documents/openai/clearmark
 ```
 
-## Safety Rules
+Typical review output:
 
-- Source images are read-only inputs.
-- Output paths inside `/Users/alexkou/Documents/github/b2bweb` are rejected.
-- Cleaned images, masks, PDFs, review HTML, and manifests are generated output;
-  they must not be committed to git.
-- iPhone 14+ only filenames are skipped because supplier images are known clean.
-- Cleaning commands require `--rights-confirmed`.
-- Oversized or uncertain masks route to `needs_manual` instead of being applied.
-
-## Current Design
-
-ClearMark now follows a compact "visual truthfulness" workflow inspired by the
-V10-V13 Mark Remover design, but implemented against this project's existing
-single-file pipeline rather than a separate 100-tool rewrite.
-
-Core principle:
-
-```text
-detect accurately -> repair conservatively -> publish only if post-clean evidence is clean
+```bash
+/Users/alexkou/Downloads/clearmark-sunsky-50
 ```
 
-Implemented stages:
+## Safety Rules
 
-1. Candidate selection skips known-clean iPhone 14+ assets and samples only
-   master images from the perceptual-hash inventory.
-2. Detection uses OCR when enabled, template matching, low-contrast text-band
-   matching, and a bright-background recall pass for faint marks. OCR now uses
-   a domain-structure score: a match must look like `sunsky`/`sky` plus
-   `online`/`.com`, so product text such as labels, steps, and random fragments
-   no longer qualifies as a Sunsky watermark.
-3. A V13-style layout guard detects text-dense instruction sheets and disables
-   weak prior text-band detection there. Those images require direct OCR or
-   strong template evidence before cleaning.
-4. Each detected footprint is classified by the pixels underneath it:
-   `plain_white`, `near_white`, `dark_product_surface`, `thin_flex_cable`,
-   `complex_product_detail`, `text_or_label_area`, and related classes. High
-   product-overlap regions use glyph-only repair attempts; broad box masks are
-   blocked to avoid wiping flex cables, printed labels, or product contours.
-5. Mask construction stays narrow around the detected text footprint, with a
-   high-contrast fallback box only when the ROI is not product-risky.
-6. Repair tries OpenCV Telea/Navier-Stokes first and optionally escalates to
-   LaMa/IOPaint when available for high-residual cases.
-7. Before giving up on a repair, a residual micro-cleanup pass targets only
-   leftover dot-chain/broken-glyph components inside the expanded watermark
-   footprint. It uses ring-fill or small-radius inpaint on those pixels, not a
-   full rectangular re-clean.
-8. The publish decision is driven by post-clean evidence: residual score,
-   template residual, post-clean text components, post-clean detection count,
-   dot-chain fragments, rectangular-band score, product-damage score, and OCR
-   on the cleaned mark-box crop.
-9. Review output shows original, mask overlay, result, and `diff x3` so visible
-   bands, damaged product detail, or leftover glyph fragments are easy to spot.
+- Use ClearMark only for images you own or are authorized to modify.
+- All cleaning commands require `--rights-confirmed`.
+- Source images are read-only inputs.
+- Output paths inside `/Users/alexkou/Documents/github/b2bweb` are rejected.
+- Generated output is never committed: `cleaned/`, `attempts/`, `masks/`,
+  `originals/`, `overlays/`, `diffs/`, `manifest.jsonl`, `summary.json`,
+  `review.html`, and `compare.pdf`.
+- iPhone 14+ only filenames are skipped. The supplier stopped watermarking
+  those series images, so they are treated as known clean.
+- A failed repair is not a cleaned image. Failed best-effort results are written
+  to `attempts/` for review only.
 
-The third-party V12 ideas that matter for this repo are now documented as the
-target direction:
+## Design Concept
 
-- one publish gate as the source of truth;
-- no zero-metric or provenance-only passes;
-- reject readable residuals, dot-chain fragments, obvious rectangular bands,
-  and product-surface damage;
-- do not let weak prior bands select watermarked-only samples in text-heavy
-  layouts;
-- classify the watermark ROI by product overlap before choosing broad vs.
-  glyph-only masks;
-- use cover-style fallback only as a clearly reported best effort;
-- keep provenance in HTML/PDF/JSON so review findings are traceable.
+Early versions tried to remove the watermark whenever a detector found a
+text-like band. That caused two bad outcomes:
 
-The current script still reports `cleaned`, `needs_manual`, and `no_watermark`.
-Future status work should split successful outputs into `clean_repaired` and
-`clean_covered` only after the cover gate is implemented and visually honest.
+- clean images or product text were selected as watermarked;
+- broad masks sometimes damaged product details while the watermark still
+  remained readable.
+
+ClearMark now follows a compact visual-truthfulness design inspired by the
+V10-V13 Mark Remover architecture, but without copying the large 100-tool
+strategy bank. The important ideas are:
+
+- confirm that the text is actually `sunsky-online.com`;
+- route repair by the pixels under the watermark, not by detector provenance;
+- use narrow glyph/component masks before any broader box mask;
+- run a final publish gate on the cleaned result, not on the method name;
+- keep failed attempts visible in review output but out of `cleaned/`.
+
+## Processing Pipeline
+
+```text
+Asset inventory
+  -> iPhone 14+ skip
+  -> perceptual-hash master selection
+  -> watermark detection
+  -> presence confirmation
+  -> ROI classification
+  -> mask construction
+  -> repair candidates
+  -> residual micro-cleanup
+  -> final publish gate
+  -> review HTML/PDF/Telegram
+```
+
+### 1. Inventory And Sampling
+
+The `inventory` step scans image metadata and computes OpenCV DCT perceptual
+hashes. Duplicate or near-duplicate images are grouped so pilots can sample
+master images instead of repeatedly testing identical assets.
+
+iPhone 14+ exclusion is handled by `should_scan_file()` in
+`scripts/watermark_pipeline.py`. The constant is:
+
+```python
+SKIP_IPHONE_MIN = 14
+```
+
+Change this only if the supplier policy changes.
+
+### 2. Watermark Detection
+
+Detection combines several signals:
+
+- EasyOCR full-image text detections when OCR is enabled;
+- canonical `sunsky-online.com` template matching;
+- low-contrast text-band recall for faint marks;
+- bright-background recall for watermark text on white product photos.
+
+The OCR matcher is deliberately specific. A match must look like the domain
+structure:
+
+```text
+sunsky/sky-like token + online/.com-like token
+```
+
+This blocks false positives such as product labels, "More product details",
+step instructions, connector text, and random OCR fragments. Examples that
+should match:
+
+```text
+sunsky-online.com
+S unsky-online.co
+sky-online.com
+~sunsky-oniine com
+```
+
+Examples that should not match:
+
+```text
+aline cer
+Stable Bracket
+More product details
+onlin com
+```
+
+### 3. Text-Dense Layout Guard
+
+Instruction sheets and multi-panel images often contain many real words and
+layout lines. Weak text-band priors are unsafe there.
+
+`image_layout_features()` computes:
+
+- edge density;
+- small connected-component count;
+- strong horizontal/vertical panel-line score;
+- text-dense and step-layout booleans.
+
+When a layout is text-dense, weak prior detections are disabled. The image must
+have direct OCR or strong template evidence before it is included in a
+watermarked-only run.
+
+### 4. ROI Classification
+
+The most important routing decision is what sits underneath the watermark.
+`estimate_product_overlap_v13()` classifies the mark box from interior pixels:
+
+- `plain_white`
+- `near_white`
+- `low_texture_background`
+- `simple_product_surface`
+- `dark_product_surface`
+- `thin_flex_cable`
+- `complex_product_detail`
+- `text_or_label_area`
+- `unknown`
+
+High-risk classes use glyph-only repair attempts. Broad white or rectangular
+fills are blocked on flex cables, dark product surfaces, labels, and complex
+product detail.
+
+### 5. Mask Strategy
+
+ClearMark prefers the smallest mask that can remove readable watermark text.
+
+Mask variants include:
+
+- glyph masks from local contrast around the detected text;
+- canonical watermark ink masks for OCR detections;
+- stronger glyph masks with slightly more dilation;
+- tight/medium box masks only on safe, low-risk backgrounds;
+- high-contrast fallback boxes only when the ROI is not product-risky.
+
+The mask area is guarded by `MAX_MASK_AREA`, `PILOT_MASK_AREA`, and combined
+mask limits. Oversized masks route to `needs_manual`.
+
+### 6. Repair Strategy
+
+The current repair engine is intentionally small:
+
+- OpenCV Telea inpaint;
+- OpenCV Navier-Stokes inpaint;
+- optional LaMa/IOPaint escalation when installed and enabled;
+- component-level residual cleanup before final rejection.
+
+This project does not yet implement the full 100-tool strategy bank. The next
+big quality step would be better pixel reconstruction for
+`thin_flex_cable`, `complex_product_detail`, and `text_or_label_area` cases.
+
+### 7. Residual Micro-Cleanup
+
+Some first-pass repairs remove most of the watermark but leave readable dot
+chains, broken glyphs, or a trailing `.com`. ClearMark detects this inside a
+horizontally expanded mark footprint.
+
+If the only blockers are residual text signals, ClearMark attempts a second
+small cleanup:
+
+- ring-median fill over leftover components;
+- small-radius Telea inpaint over only the residual component mask;
+- tighter area limits for product-overlap regions.
+
+This is not a full rectangular re-clean. It is designed to remove leftover
+glyph fragments without damaging the product.
+
+### 8. Final Publish Gate
+
+The final gate decides whether an output is allowed into `cleaned/`.
+
+It checks:
+
+- required QA metrics are present;
+- residual score is below threshold;
+- template residual is below threshold;
+- post-clean text components are minimal;
+- post-clean detector count is zero;
+- OCR on the cleaned mark-box crop does not still read Sunsky;
+- dot-chain/broken-glyph detector passes;
+- rectangular-band detector passes;
+- product-damage detector passes.
+
+If any gate fails, status is `needs_manual`. The output may still be written to
+`attempts/` for review, but it is not publishable and is not placed in
+`cleaned/`.
+
+## Output Statuses
+
+| Status | Meaning |
+| --- | --- |
+| `cleaned` | Publish gate passed. File is written to `cleaned/`. |
+| `needs_manual` | Detection exists, but cleaning did not pass final QA. Best attempt may be written to `attempts/`. |
+| `no_watermark` | No confirmed Sunsky watermark. Source is copied only for review if needed. |
+| `skipped` | Known-clean iPhone 14+ image. |
+| `cleaned_duplicate` | Duplicate reused a cleaned master result. |
+| `duplicate_no_action` | Duplicate was skipped because the master was not cleaned. |
+
+## Output Layout
+
+Each run creates:
+
+```text
+outputs/<run-id>/ or custom --out/
+  cleaned/          only publish-gate-passed cleaned image copies
+  attempts/         failed best attempts for review only
+  masks/            black/white masks
+  originals/        copied originals for review only
+  overlays/         originals with red mask overlay
+  diffs/            absolute visual difference, amplified 3x
+  manifest.jsonl    one JSON entry per selected source file
+  summary.json      counts, settings, inventory stats, Telegram result
+  review.html       side-by-side browser review
+  compare.pdf       optional PDF compare for review and Telegram
+```
+
+Review columns:
+
+```text
+Original | Mask overlay | Result | Diff x3
+```
+
+For `needs_manual`, the result column points to `attempts/` if a failed attempt
+exists. This is for inspection only.
 
 ## Commands
 
-Create image inventory, buckets, and perceptual-hash duplicate groups:
+### Install Dependencies
+
+```bash
+cd /Users/alexkou/Documents/openai/clearmark
+python3 -m pip install -r requirements.txt
+```
+
+Optional OCR uses EasyOCR. Optional neural inpainting uses
+`simple_lama_inpainting` or a local `iopaint` command.
+
+### Build Inventory
 
 ```bash
 cd /Users/alexkou/Documents/openai/clearmark
@@ -97,13 +291,14 @@ python3 scripts/watermark_pipeline.py inventory \
   --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets
 ```
 
-Run a 50-image watermarked-only review pilot and create a PDF compare:
+### Run A 50-Image Review Pilot
 
 ```bash
 cd /Users/alexkou/Documents/openai/clearmark
 python3 scripts/watermark_pipeline.py pilot \
   --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
   --max-total 50 \
+  --max-scan 700 \
   --watermarked-only \
   --preset review \
   --no-lama \
@@ -112,7 +307,10 @@ python3 scripts/watermark_pipeline.py pilot \
   --rights-confirmed
 ```
 
-Send the generated PDF to Telegram after the pilot finishes:
+Use `--no-lama` for faster review pilots. Remove it when neural inpainting is
+installed and quality matters more than runtime.
+
+### Send PDF To Telegram
 
 ```bash
 export TELEGRAM_BOT_TOKEN="..."
@@ -121,6 +319,7 @@ export TELEGRAM_CHAT_ID="..."
 python3 scripts/watermark_pipeline.py pilot \
   --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
   --max-total 50 \
+  --max-scan 700 \
   --watermarked-only \
   --preset review \
   --no-lama \
@@ -130,13 +329,13 @@ python3 scripts/watermark_pipeline.py pilot \
   --rights-confirmed
 ```
 
-Pilot mode uses OCR and optional LaMa by default for higher accuracy. For
-`--watermarked-only`, OCR confirmation is the safest way to avoid including
-non-watermarked product-detail false positives. Pass `--no-lama` for faster
-review sampling; use `--no-ocr` only for diagnostic speed runs where the sampler
-will conservatively drop weak prior-band detections.
+In this environment the Telegram token can also be loaded from:
 
-Run the one-pass production workflow:
+```bash
+/Users/alexkou/.claude/channels/telegram/.env
+```
+
+### Run One-Pass Production Processing
 
 ```bash
 cd /Users/alexkou/Documents/openai/clearmark
@@ -148,38 +347,52 @@ python3 scripts/watermark_pipeline.py process \
   --rights-confirmed
 ```
 
-One-pass workflow:
+Workflow:
 
 ```text
 for each non-iPhone-14+ master image:
     detect watermark using review preset
-    confirm it is really sunsky-online.com, not product text/details
+    confirm it is really sunsky-online.com
     if no confirmed detection -> record no_watermark and skip
-    if confirmed detection    -> build narrow/risk-routed mask, repair, validate, record cleaned/needs_manual
+    if confirmed detection    -> repair and validate
+    if publish gate passes    -> write cleaned/
+    otherwise                 -> write attempts/ for review, status needs_manual
+
 duplicates:
-    reuse master result and copy output if master was cleaned
+    reuse master result only when the master status is cleaned
 ```
 
-For speed-only process runs, omit `--ocr`; weak prior detections will then be
-skipped unless the canonical template evidence is strong enough.
+For speed-only processing, omit `--ocr`. The pipeline will then be more
+conservative and skip weak prior detections unless canonical template evidence
+is strong.
 
-## Output Layout
+## Reading The Manifest
 
-Each run creates:
+Each `manifest.jsonl` row contains fields such as:
 
-```text
-outputs/<run-id>/ or custom --out/
-  cleaned/          cleaned image copies when post-clean QA passes
-  attempts/         failed best attempts for review only; never publish these
-  masks/            black/white masks
-  originals/        copied originals for review only
-  overlays/         original images with red mask overlay
-  diffs/            absolute visual difference, amplified 3x
-  manifest.jsonl    one entry per selected source file
-  summary.json      counts, settings, inventory stats, Telegram result if used
-  review.html       side-by-side browser review
-  compare.pdf       optional PDF compare when --pdf or --telegram is used
-```
+- `file`
+- `status`
+- `presence_reason`
+- `presence_score`
+- `strategy`
+- `mask_area_pct`
+- `residual_score`
+- `template_residual_score`
+- `post_text_components`
+- `roi_class`
+- `product_overlap`
+- `cleanup_attempted`
+- `cleanup_strategy`
+- `reason`
+
+Useful review patterns:
+
+- `status=cleaned`: inspect a sample visually, but it passed the publish gate.
+- `reason=residual_visible`: some watermark-like signal remains.
+- `reason=dot_chain_residual`: broken glyph fragments remain.
+- `reason=product_damage`: repair changed product structure too much.
+- `warning=risky_roi:*`: mask was routed conservatively because the mark
+  overlaps product detail.
 
 ## Project Structure
 
@@ -188,31 +401,116 @@ clearmark/
   README.md
   requirements.txt
   scripts/
-    watermark_pipeline.py   detection, repair, QA, review HTML/PDF, Telegram send
+    watermark_pipeline.py   detection, repair, QA, review HTML/PDF, Telegram
   templates/
-    sunsky-online.png       canonical watermark template
+    watermark-template.png  canonical Sunsky text template
   outputs/                 ignored generated output
 ```
 
-## QA Direction
+## Development Checklist
 
-The next code improvements should be incremental and evidence-driven:
+Before committing code:
 
-1. Improve actual repair quality for difficult `thin_flex_cable`,
-   `complex_product_detail`, and `text_or_label_area` cases. The detector now
-   routes them safely; the remaining work is better pixel reconstruction.
-2. Add a real `clean_covered` status only after cover output passes the same
-   visual-fidelity gate as repaired output.
-3. Add regression fixtures for OCR false positives, step-layout images, and
-   dark product-overlap cases so future threshold changes cannot reintroduce
-   clean-image selection or large product masks.
+```bash
+cd /Users/alexkou/Documents/openai/clearmark
+python3 -m py_compile scripts/watermark_pipeline.py
+git diff --check
+```
 
-Do not implement a broad tiled-watermark removal pass unless fresh evidence
-shows a real repeated watermark layer in the current dataset. Prior review
-found that premise was not supported by the inspected images.
+Before trusting a quality change:
+
+```bash
+python3 scripts/watermark_pipeline.py pilot \
+  --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
+  --max-total 5 \
+  --max-scan 100 \
+  --watermarked-only \
+  --preset fast \
+  --no-lama \
+  --pdf \
+  --out /Users/alexkou/Downloads/clearmark-smoke \
+  --rights-confirmed
+```
+
+Then inspect `compare.pdf` and `manifest.jsonl`.
+
+## Troubleshooting
+
+### Clean Images Are Included In A Watermarked Pilot
+
+Use OCR-enabled `--watermarked-only` pilots. The OCR domain-structure gate is
+the safest way to avoid product-text false positives.
+
+### Sunsky Text Remains After Cleaning
+
+Check:
+
+- `residual_score`
+- `template_residual_score`
+- `dot_chain_score`
+- `ocr_text`
+- `cleanup_attempted`
+- `cleanup_strategy`
+
+If status is `needs_manual`, the file in `attempts/` is not publishable. It is
+only a visual diagnostic.
+
+### Product Detail Is Damaged
+
+Look at:
+
+- `roi_class`
+- `product_overlap`
+- `product_gate_pass`
+- `product_color_delta`
+- `product_edge_retention`
+- `product_blob_score`
+
+High-risk product classes should avoid broad masks. If damage still appears,
+add a regression fixture and tighten product routing for that ROI class.
+
+### The Run Is Slow
+
+OCR is the main cost. For quick detector experiments:
+
+```bash
+--no-ocr --preset fast --max-total 5
+```
+
+For official review pilots, keep OCR enabled.
+
+### Output Accidentally Goes Into The Source Repo
+
+The script refuses output paths under:
+
+```bash
+/Users/alexkou/Documents/github/b2bweb
+```
+
+Use `/Users/alexkou/Downloads/...` or the project `outputs/` directory.
+
+## Roadmap
+
+The current pipeline is detection-safe and publish-gated, but the repair side
+still needs better reconstruction for hard cases.
+
+Next improvements:
+
+1. Add regression fixtures for OCR false positives, step-layout pages, dark
+   product surfaces, flex cables, and `.com` tail residuals.
+2. Improve repair methods for `thin_flex_cable`, `complex_product_detail`, and
+   `text_or_label_area`.
+3. Add an honest `clean_covered` status only after cover output passes the same
+   visual-fidelity gate as `cleaned`.
+4. Add a dedicated report command that summarizes must-be-zero counters:
+   residual OCR, dot-chain residue, visible band, and product damage.
+
+Do not implement broad tiled-watermark removal unless fresh visual evidence
+shows a real repeated watermark layer in the current dataset. Earlier review
+found that premise was not supported by inspected images.
 
 ## Notes
 
 The pipeline uses OpenCV DCT for perceptual hashes, so no `imagehash` package
-is required. Optional OCR requires EasyOCR. Optional neural inpainting is used
-only when `simple_lama_inpainting` or a local `iopaint` command is available.
+is required. Generated outputs should remain local review artifacts and should
+not be pushed to GitHub.
