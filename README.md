@@ -49,7 +49,8 @@ Implemented stages:
    LaMa/IOPaint when available for high-residual cases.
 5. The publish decision is driven by post-clean evidence: residual score,
    template residual, post-clean text components, post-clean detection count,
-   and OCR on the cleaned mark-box crop.
+   dot-chain fragments, rectangular-band score, and OCR on the cleaned mark-box
+   crop.
 6. Review output shows original, mask overlay, result, and `diff x3` so visible
    bands, damaged product detail, or leftover glyph fragments are easy to spot.
 
@@ -86,7 +87,6 @@ python3 scripts/watermark_pipeline.py pilot \
   --max-total 50 \
   --watermarked-only \
   --preset review \
-  --no-ocr \
   --no-lama \
   --pdf \
   --out /Users/alexkou/Downloads/clearmark-sunsky-50 \
@@ -104,7 +104,6 @@ python3 scripts/watermark_pipeline.py pilot \
   --max-total 50 \
   --watermarked-only \
   --preset review \
-  --no-ocr \
   --no-lama \
   --pdf \
   --telegram \
@@ -112,8 +111,11 @@ python3 scripts/watermark_pipeline.py pilot \
   --rights-confirmed
 ```
 
-Pilot mode uses OCR and optional LaMa by default for higher accuracy. Pass
-`--no-ocr --no-lama` for faster review sampling.
+Pilot mode uses OCR and optional LaMa by default for higher accuracy. For
+`--watermarked-only`, OCR confirmation is the safest way to avoid including
+non-watermarked product-detail false positives. Pass `--no-lama` for faster
+review sampling; use `--no-ocr` only for diagnostic speed runs where the sampler
+will conservatively drop weak prior-band detections.
 
 Run the one-pass production workflow:
 

@@ -79,6 +79,15 @@ CLEAN_FAIL_RESIDUAL_MIN = 0.45
 CLEAN_FAIL_TEXT_COMPONENTS = 4
 LAMA_ESCALATION_RESIDUAL_MIN = 0.40
 ARTIFACT_SHARPNESS_REVIEW_RATIO = 0.18
+FINAL_RESIDUAL_MAX = 0.18
+FINAL_TEMPLATE_MAX = 0.20
+FINAL_TEXT_COMPONENTS_MAX = 1
+DOT_CHAIN_SCORE_MAX = 0.28
+DOT_CHAIN_COMPONENT_COUNT = 4
+DOT_CHAIN_SPAN_MIN = 0.22
+DOT_CHAIN_AREA_RATIO_MIN = 0.035
+VISIBLE_BAND_SCORE_MAX = 0.18
+VISIBLE_BAND_LUMA_DELTA_MAX = 8.0
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
@@ -741,6 +750,63 @@ def ocr_image_watermark_check(img: np.ndarray, reader, *, canvas_size: int = 960
     }
 
 
+def confirm_watermark_presence(
+    img: np.ndarray,
+    gray: np.ndarray,
+    detections: list[Detection],
+    ocr_reader=None,
+) -> dict:
+    """Confirm that a detection is likely the Sunsky watermark, not a product detail.
+
+    The permissive prior text-band detector is useful for recall, but it must
+    not decide watermarked-only sampling by itself. OCR is authoritative when
+    available; without OCR, only strong canonical-template detections pass.
+    """
+    if not detections:
+        return {"presence_confirmed": False, "presence_reason": "no_detection"}
+
+    if any(det.template.startswith("ocr:") for det in detections):
+        return {"presence_confirmed": True, "presence_reason": "ocr_detection"}
+
+    if ocr_reader is not None:
+        checked = []
+        for det in detections[:3]:
+            pad_x = max(10, int(round(det.mark_box["w"] * 0.16)))
+            pad_y = max(8, int(round(det.mark_box["h"] * 0.90)))
+            crop = padded_crop(img, det.mark_box, pad_x, pad_y)
+            ocr_meta = ocr_image_watermark_check(crop, ocr_reader, canvas_size=760, mag_ratio=2.0)
+            checked.extend(ocr_meta.get("ocr_text", []))
+            if ocr_meta.get("ocr_watermark"):
+                return {
+                    "presence_confirmed": True,
+                    "presence_reason": "ocr_crop_confirmed",
+                    "presence_ocr_text": checked[:8],
+                }
+        return {
+            "presence_confirmed": False,
+            "presence_reason": "ocr_crop_not_confirmed",
+            "presence_ocr_text": checked[:8],
+        }
+
+    best = detections[0]
+    canonical = best.template.startswith("watermark-template")
+    strong_template = (
+        canonical
+        and best.confidence >= 0.68
+        and best.verify_score >= 0.56
+        and best.text_score >= 0.42
+        and best.text_components >= 10
+        and best.contrast_span <= REVIEW_CONTRAST_SPAN
+        and best.line_dominance <= 0.45
+    )
+    if strong_template:
+        return {"presence_confirmed": True, "presence_reason": "strong_template_no_ocr"}
+    return {
+        "presence_confirmed": False,
+        "presence_reason": "weak_or_prior_detection_without_ocr",
+    }
+
+
 def bright_text_likeness(gray: np.ndarray, box: dict) -> tuple[float, int, float]:
     """Score faint grey text on white or bright backgrounds.
 
@@ -1186,6 +1252,183 @@ def residual_quality_metrics(
     }
 
 
+def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
+    """Detect dot-chain or broken-glyph residue in the known watermark footprint."""
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    pad_x = max(8, int(round(b["w"] * 0.18)))
+    pad_y = max(5, int(round(b["h"] * 0.45)))
+    x1 = max(0, b["x"] - pad_x)
+    y1 = max(0, b["y"] - pad_y)
+    x2 = min(img_w, b["x"] + b["w"] + pad_x)
+    y2 = min(img_h, b["y"] + b["h"] + pad_y)
+    roi = gray[y1:y2, x1:x2]
+    full_mask = np.zeros_like(gray)
+    if roi.shape[0] < 8 or roi.shape[1] < 40:
+        return {
+            "dot_chain_score": 0.0,
+            "dot_component_count": 0,
+            "dot_horizontal_span": 0.0,
+            "dot_component_area_ratio": 0.0,
+            "dot_chain_fail": False,
+            "component_mask": full_mask,
+        }
+
+    kernel = max(5, min(31, (roi.shape[0] // 2) * 2 + 1))
+    background = cv2.medianBlur(roi, kernel)
+    dev = cv2.absdiff(roi, background)
+    threshold = max(3.0, float(np.percentile(dev, 86)))
+    raw = (dev >= threshold).astype(np.uint8) * 255
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
+    kept = np.zeros_like(raw)
+    xs = []
+    total_area = 0
+    components = 0
+    for idx in range(1, count):
+        xx, yy, ww, hh, area = stats[idx]
+        if area < 2 or area > roi.size * 0.055:
+            continue
+        if hh < 2 or hh > roi.shape[0] * 0.78:
+            continue
+        if ww > roi.shape[1] * 0.30:
+            continue
+        components += 1
+        total_area += int(area)
+        xs.extend([xx, xx + ww])
+        kept[labels == idx] = 255
+
+    horizontal_span = ((max(xs) - min(xs)) / max(roi.shape[1], 1)) if xs else 0.0
+    area_ratio = total_area / max(roi.size, 1)
+    score = (
+        min(1.0, components / 8.0) * 0.38
+        + min(1.0, horizontal_span) * 0.42
+        + min(1.0, area_ratio / 0.08) * 0.20
+    )
+    fail = (
+        score > DOT_CHAIN_SCORE_MAX
+        or (
+            components >= DOT_CHAIN_COMPONENT_COUNT
+            and horizontal_span > DOT_CHAIN_SPAN_MIN
+            and area_ratio > DOT_CHAIN_AREA_RATIO_MIN
+        )
+    )
+    full_mask[y1:y2, x1:x2] = kept
+    return {
+        "dot_chain_score": float(score),
+        "dot_component_count": int(components),
+        "dot_horizontal_span": float(horizontal_span),
+        "dot_component_area_ratio": float(area_ratio),
+        "dot_chain_fail": bool(fail),
+        "component_mask": full_mask,
+    }
+
+
+def cleanup_residual_components_with_ring_fill(img: np.ndarray, component_mask: np.ndarray, det: Detection) -> np.ndarray | None:
+    if component_mask is None or np.count_nonzero(component_mask) < 4:
+        return None
+    b = det.mark_box
+    if det.contrast_span > REVIEW_CONTRAST_SPAN:
+        return None
+    img_h, img_w = img.shape[:2]
+    x1 = max(0, b["x"] - max(10, b["w"] // 8))
+    y1 = max(0, b["y"] - max(8, b["h"]))
+    x2 = min(img_w, b["x"] + b["w"] + max(10, b["w"] // 8))
+    y2 = min(img_h, b["y"] + b["h"] + max(8, b["h"]))
+    inner = np.zeros(component_mask.shape, dtype=np.uint8)
+    inner[b["y"]:b["y"] + b["h"], b["x"]:b["x"] + b["w"]] = 255
+    window = np.zeros(component_mask.shape, dtype=np.uint8)
+    window[y1:y2, x1:x2] = 255
+    ring = cv2.bitwise_and(window, cv2.bitwise_not(inner))
+    ring_pixels = img[ring > 0]
+    if ring_pixels.size == 0:
+        return None
+    fill = np.median(ring_pixels.reshape(-1, 3), axis=0)
+    mask = cv2.dilate((component_mask > 0).astype(np.uint8) * 255, np.ones((3, 5), np.uint8), iterations=1)
+    if float(np.count_nonzero(mask)) / max(1, mask.size) > 0.012:
+        return None
+    alpha = cv2.GaussianBlur(mask, (0, 0), 0.8).astype(np.float32)[:, :, None] / 255.0
+    cleaned = img.astype(np.float32) * (1.0 - alpha) + fill.reshape(1, 1, 3).astype(np.float32) * alpha
+    return np.uint8(np.clip(cleaned, 0, 255))
+
+
+def detect_rectangular_band_visibility(original: np.ndarray, candidate: np.ndarray, mask: np.ndarray | None) -> dict:
+    if mask is None or np.count_nonzero(mask) == 0:
+        return {
+            "visible_band_score": 0.0,
+            "band_luma_delta": 0.0,
+            "band_edge_box": 0.0,
+            "band_gate_fail": False,
+        }
+    diff = cv2.absdiff(original, candidate)
+    luma = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(mask > 0)
+    y1, y2 = max(0, ys.min() - 4), min(mask.shape[0], ys.max() + 5)
+    x1, x2 = max(0, xs.min() - 4), min(mask.shape[1], xs.max() + 5)
+    roi = luma[y1:y2, x1:x2]
+    if roi.size == 0:
+        return {
+            "visible_band_score": 0.0,
+            "band_luma_delta": 0.0,
+            "band_edge_box": 0.0,
+            "band_gate_fail": False,
+        }
+    band_luma_delta = float(np.mean(roi))
+    top = float(np.mean(roi[:2, :])) if roi.shape[0] >= 4 else 0.0
+    bottom = float(np.mean(roi[-2:, :])) if roi.shape[0] >= 4 else 0.0
+    left = float(np.mean(roi[:, :2])) if roi.shape[1] >= 4 else 0.0
+    right = float(np.mean(roi[:, -2:])) if roi.shape[1] >= 4 else 0.0
+    center = float(np.mean(roi[2:-2, 2:-2])) if roi.shape[0] > 5 and roi.shape[1] > 5 else band_luma_delta
+    edge_box = max(top, bottom, left, right) / max(center, 1.0)
+    visible_score = min(1.0, band_luma_delta / 32.0) * 0.62 + min(1.0, edge_box / 2.5) * 0.38
+    fail = visible_score > VISIBLE_BAND_SCORE_MAX and band_luma_delta > VISIBLE_BAND_LUMA_DELTA_MAX and edge_box > 1.20
+    return {
+        "visible_band_score": float(visible_score),
+        "band_luma_delta": band_luma_delta,
+        "band_edge_box": float(edge_box),
+        "band_gate_fail": bool(fail),
+    }
+
+
+def final_publish_gate(
+    metrics: dict,
+    post_count: int | None,
+    ocr_meta: dict,
+    dot_metrics: dict,
+    band_metrics: dict,
+) -> dict:
+    required = ["residual_score", "template_residual_score", "post_text_score", "post_text_components"]
+    metrics_valid = all(isinstance(metrics.get(key), (int, float)) for key in required)
+    residual_pass = (
+        metrics_valid
+        and float(metrics["residual_score"]) <= FINAL_RESIDUAL_MAX
+        and float(metrics["template_residual_score"]) <= FINAL_TEMPLATE_MAX
+        and int(metrics["post_text_components"]) <= FINAL_TEXT_COMPONENTS_MAX
+        and (post_count == 0)
+        and not bool(ocr_meta.get("ocr_watermark"))
+    )
+    dot_pass = not bool(dot_metrics.get("dot_chain_fail"))
+    band_pass = not bool(band_metrics.get("band_gate_fail"))
+    reject_reasons = []
+    if not metrics_valid:
+        reject_reasons.append("missing_required_qa_metric")
+    if not residual_pass:
+        reject_reasons.append("residual_visible")
+    if not dot_pass:
+        reject_reasons.append("dot_chain_residual")
+    if not band_pass:
+        reject_reasons.append("visible_rectangular_band")
+    publish_ok = metrics_valid and residual_pass and dot_pass and band_pass
+    return {
+        "publish_ok": bool(publish_ok),
+        "status": "cleaned" if publish_ok else "needs_manual",
+        "reject_reasons": reject_reasons,
+        "metrics_valid": bool(metrics_valid),
+        "residual_pass": bool(residual_pass),
+        "dot_chain_pass": bool(dot_pass),
+        "band_pass": bool(band_pass),
+    }
+
+
 def laplacian_var(gray: np.ndarray, mask: np.ndarray | None = None) -> float:
     if mask is not None and np.count_nonzero(mask):
         ys, xs = np.where(mask > 0)
@@ -1353,7 +1596,29 @@ def clean_image(
         }
 
     candidates.sort(reverse=True, key=lambda item: item[0])
-    _, residual, template_residual, ratio, area, name, best, mask, metrics = candidates[0]
+    selected = candidates[0]
+    selected_eval: dict | None = None
+    for cand in candidates[:10]:
+        _, cresidual, ctemplate_residual, cratio, carea, cname, cbest, cmask, cmetrics = cand
+        cgray = cv2.cvtColor(cbest, cv2.COLOR_BGR2GRAY)
+        cpost_count = post_clean_detection_count(cbest, cgray, templates)
+        cocr_meta = cleaned_crop_ocr_check(cbest, det, ocr_reader)
+        cdot_metrics = residual_component_metrics(cgray, det)
+        cband_metrics = detect_rectangular_band_visibility(img, cbest, cmask)
+        cgate_meta = final_publish_gate(cmetrics, cpost_count, cocr_meta, cdot_metrics, cband_metrics)
+        if cgate_meta["publish_ok"]:
+            selected = cand
+            selected_eval = {
+                "gray": cgray,
+                "post_count": cpost_count,
+                "ocr_meta": cocr_meta,
+                "dot_metrics": cdot_metrics,
+                "band_metrics": cband_metrics,
+                "gate_meta": cgate_meta,
+            }
+            break
+
+    _, residual, template_residual, ratio, area, name, best, mask, metrics = selected
 
     lama_reason = ""
     if ENABLE_LAMA_ESCALATION and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
@@ -1378,49 +1643,70 @@ def clean_image(
                 metrics = lmetrics
                 best = lama
                 name = "lama"
+                selected_eval = None
 
-    best_gray = cv2.cvtColor(best, cv2.COLOR_BGR2GRAY)
-    post_count = post_clean_detection_count(best, best_gray, templates)
+    if selected_eval is not None:
+        best_gray = selected_eval["gray"]
+        post_count = selected_eval["post_count"]
+        ocr_meta = selected_eval["ocr_meta"]
+        dot_metrics = selected_eval["dot_metrics"]
+        band_metrics = selected_eval["band_metrics"]
+        gate_meta = selected_eval["gate_meta"]
+    else:
+        best_gray = cv2.cvtColor(best, cv2.COLOR_BGR2GRAY)
+        post_count = post_clean_detection_count(best, best_gray, templates)
+        ocr_meta = cleaned_crop_ocr_check(best, det, ocr_reader)
+        dot_metrics = residual_component_metrics(best_gray, det)
+        band_metrics = detect_rectangular_band_visibility(img, best, mask)
+        gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics)
     broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
     position_confident = not det.template.startswith("prior:")
-    strict_pass = (
-        residual < CLEAN_STRICT_RESIDUAL_MAX
-        and template_residual < CLEAN_STRICT_TEMPLATE_MAX
-        and metrics["post_text_components"] <= 1
-    )
-    hard_fail = residual >= CLEAN_FAIL_RESIDUAL_MIN or metrics["post_text_components"] >= CLEAN_FAIL_TEXT_COMPONENTS
 
-    reason = ""
-    gate = ""
-    ocr_meta: dict = {"ocr_checked": False, "ocr_watermark": None, "ocr_text": []}
+    cleanup_attempted = False
+    if (
+        not gate_meta["publish_ok"]
+        and "dot_chain_residual" in gate_meta["reject_reasons"]
+        and metrics["residual_score"] <= 0.32
+        and metrics["template_residual_score"] <= 0.34
+    ):
+        cleanup_attempted = True
+        cleanup = cleanup_residual_components_with_ring_fill(best, dot_metrics["component_mask"], det)
+        if cleanup is not None:
+            cgray = cv2.cvtColor(cleanup, cv2.COLOR_BGR2GRAY)
+            cleanup_metrics = residual_quality_metrics(cgray, det, templates)
+            cleanup_post_count = post_clean_detection_count(cleanup, cgray, templates)
+            cleanup_ocr_meta = cleaned_crop_ocr_check(cleanup, det, ocr_reader)
+            cleanup_dot_metrics = residual_component_metrics(cgray, det)
+            cleanup_band_metrics = detect_rectangular_band_visibility(img, cleanup, mask)
+            cleanup_gate = final_publish_gate(
+                cleanup_metrics,
+                cleanup_post_count,
+                cleanup_ocr_meta,
+                cleanup_dot_metrics,
+                cleanup_band_metrics,
+            )
+            if cleanup_gate["publish_ok"] or (
+                cleanup_metrics["residual_score"] < metrics["residual_score"]
+                and cleanup_metrics["template_residual_score"] <= metrics["template_residual_score"] + 0.04
+            ):
+                best = cleanup
+                best_gray = cgray
+                metrics = cleanup_metrics
+                residual = metrics["residual_score"]
+                template_residual = metrics["template_residual_score"]
+                post_count = cleanup_post_count
+                ocr_meta = cleanup_ocr_meta
+                dot_metrics = cleanup_dot_metrics
+                band_metrics = cleanup_band_metrics
+                gate_meta = cleanup_gate
+                name = f"{name}_micro_cleanup"
+
+    status = gate_meta["status"]
+    reject_reasons = list(gate_meta["reject_reasons"])
     if ratio < SHARPNESS_MIN_RATIO and residual >= CLEAN_FAIL_RESIDUAL_MIN:
-        status = "needs_manual"
-        reason = "blurry_and_residual"
-        gate = "fail_blurry_and_residual"
-    elif hard_fail:
-        status = "needs_manual"
-        reason = "residual_visible"
-        gate = "fail_residual_or_text_components"
-    elif strict_pass:
-        status = "cleaned"
-        gate = "pass_strict_post_clean_metrics"
-    else:
-        ocr_meta = cleaned_crop_ocr_check(best, det, ocr_reader)
-        if ocr_meta.get("ocr_checked"):
-            if ocr_meta.get("ocr_watermark"):
-                status = "needs_manual"
-                reason = "ocr_residual_text"
-                gate = "gray_zone_ocr_watermark"
-            else:
-                status = "cleaned"
-                gate = "gray_zone_ocr_clear"
-        elif post_count == 0 and residual < 0.35 and template_residual < 0.35 and metrics["post_text_components"] <= 2:
-            status = "cleaned"
-            gate = "gray_zone_post_detection_clear"
-        else:
-            status = "needs_manual"
-            reason = "gray_zone_needs_ocr"
-            gate = "gray_zone_no_ocr"
+        reject_reasons.append("blurry_and_residual")
+    reason = ";".join(dict.fromkeys(reject_reasons))
+    gate = "final_publish_gate_pass" if gate_meta["publish_ok"] else "final_publish_gate_reject"
 
     warnings = []
     if ratio < 0.55:
@@ -1446,6 +1732,18 @@ def clean_image(
         "post_clean_detection_count": post_count,
         "position_confident": position_confident,
         "broad_mask": broad_mask,
+        "metrics_valid": gate_meta["metrics_valid"],
+        "residual_pass": gate_meta["residual_pass"],
+        "dot_chain_pass": gate_meta["dot_chain_pass"],
+        "band_pass": gate_meta["band_pass"],
+        "dot_chain_score": round(float(dot_metrics["dot_chain_score"]), 4),
+        "dot_component_count": dot_metrics["dot_component_count"],
+        "dot_horizontal_span": round(float(dot_metrics["dot_horizontal_span"]), 4),
+        "dot_component_area_ratio": round(float(dot_metrics["dot_component_area_ratio"]), 4),
+        "visible_band_score": round(float(band_metrics["visible_band_score"]), 4),
+        "band_luma_delta": round(float(band_metrics["band_luma_delta"]), 4),
+        "band_edge_box": round(float(band_metrics["band_edge_box"]), 4),
+        "cleanup_attempted": cleanup_attempted,
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
         meta.update({
@@ -1897,6 +2195,7 @@ def process_file(
     out_dir: Path,
     review: bool,
     ocr_reader=None,
+    require_presence_confirmed: bool = False,
 ) -> dict:
     img = cv2.imread(str(path))
     if img is None:
@@ -1921,12 +2220,32 @@ def process_file(
             entry["review_cleaned"] = f"originals/{path.name}"
             entry["review_diff"] = f"diffs/{path.name}"
         return entry
+    presence = confirm_watermark_presence(img, gray, detections, ocr_reader)
+    if require_presence_confirmed and not presence.get("presence_confirmed"):
+        entry = {"file": path.name, "status": "no_watermark", **presence}
+        if review:
+            original_path = out_dir / "originals" / path.name
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, original_path)
+            mask_path = out_dir / "masks" / path.name
+            write_blank_mask(mask_path, img)
+            overlay_path = out_dir / "overlays" / path.name
+            write_mask_overlay(overlay_path, img, None)
+            diff_path = out_dir / "diffs" / path.name
+            write_diff_image(diff_path, img, None)
+            entry["review_original"] = f"originals/{path.name}"
+            entry["review_mask"] = f"overlays/{path.name}"
+            entry["mask_binary"] = str(mask_path)
+            entry["review_cleaned"] = f"originals/{path.name}"
+            entry["review_diff"] = f"diffs/{path.name}"
+        return entry
     targets = cleaning_targets(detections)
     cleaned, mask, meta = clean_all_detections(img, gray, targets, templates, ocr_reader=ocr_reader)
     meta["detected_count"] = len(detections)
     entry = {
         "file": path.name,
         **meta,
+        **presence,
         "detection": detections[0].to_json(),
         "detections": [det.to_json() for det in detections],
     }
@@ -1989,10 +2308,19 @@ def cmd_pilot(args: argparse.Namespace) -> None:
     skipped_no_watermark = 0
     started = time.time()
     for idx, fname in enumerate(sample, 1):
-        row = process_file(assets / fname, templates, args.preset, out_dir, review=True, ocr_reader=ocr_reader)
+        row = process_file(
+            assets / fname,
+            templates,
+            args.preset,
+            out_dir,
+            review=True,
+            ocr_reader=ocr_reader,
+            require_presence_confirmed=args.watermarked_only,
+        )
         if args.watermarked_only and row["status"] == "no_watermark":
             skipped_no_watermark += 1
-            print(f"  pilot scan {idx}/{len(sample)} selected {len(rows)}/{args.max_total} skip no_watermark {fname}")
+            presence_reason = row.get("presence_reason", "no_detection")
+            print(f"  pilot scan {idx}/{len(sample)} selected {len(rows)}/{args.max_total} skip {presence_reason} {fname}")
             continue
         rows.append(row)
         print(f"  pilot {idx}/{len(sample)} selected {len(rows)}/{args.max_total} {row['status']} {fname}")
