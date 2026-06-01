@@ -69,6 +69,7 @@ PRESETS = {
 }
 
 MAX_MASK_AREA = 0.03
+OCR_DETECTION_MAX_AREA = 0.045
 PILOT_MASK_AREA = 0.022
 INPAINT_RADIUS = 5
 SHARPNESS_MIN_RATIO = 0.30
@@ -103,6 +104,8 @@ OCR_DIRECT_MIN = 0.78
 OCR_CROP_MIN = 0.76
 OCR_LOW_CONF_DIRECT_MIN = 0.88
 OCR_POST_CLEAN_SUSPECT_MIN = 0.62
+OCR_CROP_LOCALIZE_MIN = 0.62
+WATERMARK_CANONICAL_ASPECT = 7.86
 ENABLE_BRIGHT_RECALL = True
 ENABLE_HIGH_CONTRAST_BOX_MASK = True
 ENABLE_LAMA_ESCALATION = True
@@ -753,6 +756,10 @@ def detection_rank(det: Detection, img_w: int, img_h: int) -> float:
     )
     if det.template.startswith("prior:"):
         rank -= 0.75
+        if det.roi_class in {"dark_product_surface", "thin_flex_cable", "complex_product_detail", "text_or_label_area"}:
+            rank -= 0.85
+        if det.product_overlap >= 0.55:
+            rank -= 0.40
     return rank
 
 
@@ -853,6 +860,10 @@ def ocr_confidence_pass(score: float, conf: float, *, crop: bool = False) -> boo
     return score >= OCR_DIRECT_MIN and (conf >= 0.18 or score >= OCR_LOW_CONF_DIRECT_MIN)
 
 
+def ocr_crop_localization_pass(score: float, conf: float) -> bool:
+    return score >= OCR_CROP_LOCALIZE_MIN and (conf >= 0.08 or score >= 0.86)
+
+
 def load_ocr_reader(enabled: bool):
     if not enabled:
         return None
@@ -861,6 +872,75 @@ def load_ocr_reader(enabled: bool):
     except Exception as exc:  # pragma: no cover - depends on optional runtime package
         raise SystemExit(f"--ocr requested but easyocr is unavailable: {exc}") from exc
     return easyocr.Reader(["en"], gpu=False, verbose=False)
+
+
+def ocr_mark_box_from_points(
+    pts: np.ndarray,
+    text: str,
+    img_w: int,
+    img_h: int,
+) -> dict:
+    """Normalize an OCR text bbox to the actual Sunsky domain footprint.
+
+    EasyOCR sometimes merges nearby product labels into the same line, e.g.
+    "sunsky-online 12mini". The repair mask must stay on the domain text, so
+    very wide OCR lines are clamped back toward the canonical watermark aspect.
+    """
+    x1 = float(np.min(pts[:, 0]))
+    y1 = float(np.min(pts[:, 1]))
+    x2 = float(np.max(pts[:, 0]))
+    y2 = float(np.max(pts[:, 1]))
+    raw_w = max(1.0, x2 - x1)
+    raw_h = max(1.0, y2 - y1)
+    cx = x1 + raw_w / 2.0
+    cy = y1 + raw_h / 2.0
+
+    mark_h = max(10.0, raw_h * 1.18)
+    mark_h = min(mark_h, img_h * 0.072)
+    min_w = max(45.0, raw_h * 5.4)
+    max_w = min(img_w * 0.46, max(raw_w * 1.22, raw_h * 11.2))
+    raw_aspect = raw_w / raw_h
+    norm = normalize_ocr_text(text)
+
+    domain_end = -1
+    for token in ("online", "onlne", "oniine", "onlin", "onling", "oniin", "onlinl"):
+        pos = norm.find(token)
+        if pos >= 0:
+            domain_end = max(domain_end, pos + len(token))
+    com_pos = norm.find("com", max(0, domain_end))
+    if com_pos >= 0:
+        domain_end = max(domain_end, com_pos + 3)
+    trailing = norm[domain_end:] if domain_end >= 0 else ""
+    has_trailing_model = bool(trailing) and (
+        any(ch.isdigit() for ch in trailing)
+        or any(token in trailing for token in ("mini", "pro", "max", "plus"))
+    )
+    if has_trailing_model and norm.startswith(("sun", "sur", "sum", "unsky", "sky")):
+        domain_fraction = max(0.48, min(0.92, (domain_end + 1) / max(len(norm), 1)))
+        trailing_min_w = max(45.0, raw_h * 4.6)
+        mark_w = max(trailing_min_w, raw_w * domain_fraction * 0.92)
+        mark_w = min(max_w, mark_h * 5.0, mark_w)
+        x = x1 - max(3.0, mark_w * 0.025)
+        y = cy - mark_h / 2.0
+        return clamp_box(x, y, mark_w, mark_h, img_w, img_h)
+
+    if raw_aspect > 11.2:
+        mark_w = min(max_w, max(min_w, raw_h * 9.2))
+        # Most merged OCR lines start with the watermark and append a product
+        # token. Anchor left so the extra trailing label is not masked.
+        if norm.startswith(("sun", "sur", "sum", "unsky", "sky")):
+            x = x1 - max(3.0, mark_w * 0.03)
+        else:
+            x = cx - mark_w / 2.0
+    elif raw_aspect < 5.2:
+        mark_w = min(max_w, max(raw_w * 1.08, WATERMARK_CANONICAL_ASPECT * raw_h))
+        x = cx - mark_w / 2.0
+    else:
+        mark_w = min(max_w, max(min_w, raw_w * 1.08))
+        x = cx - mark_w / 2.0
+
+    y = cy - mark_h / 2.0
+    return clamp_box(x, y, mark_w, mark_h, img_w, img_h)
 
 
 def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[Detection]:
@@ -890,15 +970,9 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
         if not ocr_confidence_pass(text_score_match, conf, crop=False):
             continue
         pts = np.array(box, dtype=np.float32)
-        x1 = float(np.min(pts[:, 0]))
-        y1 = float(np.min(pts[:, 1]))
-        x2 = float(np.max(pts[:, 0]))
-        y2 = float(np.max(pts[:, 1]))
-        pad_x = max(4.0, (x2 - x1) * 0.03)
-        pad_y = max(3.0, (y2 - y1) * 0.10)
-        mark = clamp_box(x1 - pad_x, y1 - pad_y, (x2 - x1) + 2 * pad_x, (y2 - y1) + 2 * pad_y, img_w, img_h)
+        mark = ocr_mark_box_from_points(pts, raw_text, img_w, img_h)
         area_pct = 100.0 * mark["w"] * mark["h"] / max(1, img_w * img_h)
-        if area_pct > 100 * MAX_MASK_AREA:
+        if area_pct > 100 * OCR_DETECTION_MAX_AREA:
             continue
         text_score, text_components = text_likeness(gray, mark)
         features = band_features(gray, mark)
@@ -926,6 +1000,91 @@ def ocr_watermark_detections(img: np.ndarray, gray: np.ndarray, reader) -> list[
             ocr_watermark_score=text_score_match,
         ))
     return detections
+
+
+def ocr_crop_watermark_detections(
+    img: np.ndarray,
+    gray: np.ndarray,
+    source_detections: list[Detection],
+    reader,
+    *,
+    max_sources: int = 12,
+) -> list[Detection]:
+    """Localize faint watermarks inside candidate crops.
+
+    The template/prior detector is allowed to propose a broad neighborhood for
+    recall, but it is not allowed to decide the repair position when crop OCR
+    can read the actual Sunsky string. This fixes the common failure where a
+    low-contrast watermark above a dark flex cable is confirmed by OCR, while
+    the mask itself lands on product printing below it.
+    """
+    if reader is None or img.size == 0 or not source_detections:
+        return []
+    img_h, img_w = gray.shape[:2]
+    localized: list[Detection] = []
+    # Use a wider source beam than the final repair beam. Some wrong prior
+    # boxes score higher than the true faint watermark on product surfaces; the
+    # OCR crop pass is specifically meant to rescue those lower-ranked but
+    # nearby candidates.
+    sources = sorted(source_detections, key=lambda d: detection_rank(d, img_w, img_h), reverse=True)[:max_sources]
+    for src in sources:
+        b = src.mark_box
+        pad_x = max(18, int(round(b["w"] * 0.28)))
+        pad_y = max(18, int(round(b["h"] * 2.40)))
+        x1 = max(0, b["x"] - pad_x)
+        y1 = max(0, b["y"] - pad_y)
+        x2 = min(img_w, b["x"] + b["w"] + pad_x)
+        y2 = min(img_h, b["y"] + b["h"] + pad_y)
+        crop = img[y1:y2, x1:x2]
+        if crop.shape[0] < 12 or crop.shape[1] < 45:
+            continue
+        try:
+            results = reader.readtext(
+                crop,
+                detail=1,
+                paragraph=False,
+                text_threshold=0.14,
+                low_text=0.035,
+                link_threshold=0.08,
+                canvas_size=760,
+                mag_ratio=2.2,
+            )
+        except Exception:
+            continue
+        for box, text, conf in results:
+            raw_text = str(text)
+            text_score_match = watermark_text_score(raw_text)
+            conf = float(conf)
+            if not ocr_crop_localization_pass(text_score_match, conf):
+                continue
+            pts = np.array(box, dtype=np.float32)
+            pts[:, 0] += x1
+            pts[:, 1] += y1
+            mark = ocr_mark_box_from_points(pts, raw_text, img_w, img_h)
+            area_pct = 100.0 * mark["w"] * mark["h"] / max(1, img_w * img_h)
+            if area_pct > 100 * OCR_DETECTION_MAX_AREA:
+                continue
+            text_score, text_components = text_likeness(gray, mark)
+            features = band_features(gray, mark)
+            confidence = min(1.0, 0.86 + text_score_match * 0.10 + min(1.0, conf) * 0.04)
+            localized.append(Detection(
+                x=mark["x"], y=mark["y"], w=mark["w"], h=mark["h"],
+                score=max(0.76, text_score_match),
+                verify_score=max(0.78, src.verify_score),
+                template=f"ocr:crop:{raw_text[:42]}",
+                scale=1.0,
+                mark_box=mark,
+                mask_area_pct=area_pct,
+                text_score=max(text_score, 0.92),
+                text_components=max(text_components, 12),
+                contrast_span=features["contrast_span"],
+                line_dominance=features["line_dominance"],
+                confidence=confidence,
+                ocr_text=raw_text,
+                ocr_confidence=conf,
+                ocr_watermark_score=text_score_match,
+            ))
+    return localized
 
 
 def ocr_image_watermark_check(img: np.ndarray, reader, *, canvas_size: int = 960, mag_ratio: float = 2.5) -> dict:
@@ -1391,6 +1550,8 @@ def detect_watermark(
                 ))
     if ENABLE_BRIGHT_RECALL and not found and ocr_reader is not None and not layout.get("text_dense_layout"):
         found.extend(bright_background_text_band_detections(gray, img=img, ocr_reader=ocr_reader))
+    if img is not None and ocr_reader is not None and found:
+        found.extend(ocr_crop_watermark_detections(img, gray, found, ocr_reader))
     for det in found:
         annotate_detection_context(det, gray, layout)
     return nms(found, img_w, img_h, int(preset["max_detections"]))
@@ -1413,13 +1574,13 @@ def create_mask(
     y2 = min(img_h, b["y"] + b["h"] + pad_y)
     mask = np.zeros((img_h, img_w), dtype=np.uint8)
     if glyph:
-        if det.template.startswith("ocr:"):
+        if det.template.startswith(("ocr:", "prior:", "watermark-template")):
             ink = canonical_ink_mask()
             ih, iw = ink.shape[:2]
             target_w = max(24, int(round(b["w"] * 0.94)))
             target_h = max(8, int(round(target_w * ih / max(iw, 1))))
-            if target_h > b["h"] * 0.72:
-                target_h = max(8, int(round(b["h"] * 0.72)))
+            if target_h > b["h"] * 0.95:
+                target_h = max(8, int(round(b["h"] * 0.95)))
                 target_w = max(24, int(round(target_h * iw / max(ih, 1))))
             target_w = min(target_w, img_w)
             target_h = min(target_h, img_h)
