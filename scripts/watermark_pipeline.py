@@ -30,12 +30,22 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+from sunsky_alpha_engine import (
+    ALPHA_FLOOR,
+    FINAL_ALPHA_TEMPLATE_MAX,
+    MIN_ALPHA_RESIDUAL_REDUCTION,
+    SunskyAlphaEngine,
+    score_alpha_residual,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ASSETS = Path("/Users/alexkou/Documents/github/b2bweb/content/products/assets")
 SOURCE_REPO = Path("/Users/alexkou/Documents/github/b2bweb").resolve()
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 TEMPLATE_DIR = PROJECT_ROOT / "templates"
+SUNSKY_ALPHA_PATH = TEMPLATE_DIR / "sunsky-alpha.png"
+SUNSKY_ALPHA_META_PATH = TEMPLATE_DIR / "sunsky-alpha-meta.json"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 SKIP_IPHONE_MIN = 14
@@ -92,6 +102,19 @@ VISIBLE_BAND_SCORE_MAX = 0.18
 VISIBLE_BAND_LUMA_DELTA_MAX = 8.0
 RESIDUAL_CLEANUP_AREA_MAX = 0.016
 RESIDUAL_CLEANUP_RISKY_AREA_MAX = 0.006
+RESIDUAL_CLEANUP_DILATE_X = 5
+RESIDUAL_CLEANUP_DILATE_Y = 2
+RESIDUAL_CLEANUP_MAX_AREA_MULTIPLIER = 2.2
+RESIDUAL_CLEANUP_MAX_AREA_PCT = 0.012
+RISKY_RESIDUAL_CLEANUP_MAX_AREA_MULTIPLIER = 1.45
+RISKY_RESIDUAL_CLEANUP_DILATE_X = 3
+RISKY_RESIDUAL_CLEANUP_DILATE_Y = 1
+TAIL_EXPAND_RATIO_X = 0.08
+TAIL_EXPAND_MIN_PX = 4
+TAIL_EXPAND_MAX_PX = 18
+TOP_K_CANDIDATES = 5
+MAX_SECOND_PASS_ATTEMPTS = 2
+MAX_TOTAL_REPAIR_CANDIDATES = 24
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
@@ -111,6 +134,8 @@ ENABLE_HIGH_CONTRAST_BOX_MASK = True
 ENABLE_LAMA_ESCALATION = True
 _CANONICAL_INK_MASK: np.ndarray | None = None
 _SIMPLE_LAMA = None
+_SUNSKY_ALPHA_ENGINE: SunskyAlphaEngine | None = None
+_SUNSKY_ALPHA_META: dict | None = None
 
 
 @dataclass
@@ -174,6 +199,31 @@ class TemplateSpec:
     kind: str
     start: float = 0.0
     end: float = 1.0
+
+
+@dataclass
+class RepairCandidate:
+    id: str
+    rank_score: float
+    residual: float
+    template_residual: float
+    sharpness_ratio: float
+    mask_area: float
+    strategy: str
+    image: np.ndarray
+    mask: np.ndarray
+    metrics: dict
+    category: str = "candidate_failed_metrics_invalid"
+    gray: np.ndarray | None = None
+    post_count: int | None = None
+    ocr_meta: dict | None = None
+    dot_metrics: dict | None = None
+    band_metrics: dict | None = None
+    product_metrics: dict | None = None
+    gate_meta: dict | None = None
+    second_pass: bool = False
+    second_pass_strategy: str = ""
+    second_pass_mask_area: float = 0.0
 
 
 def now_run_id(prefix: str) -> str:
@@ -347,6 +397,87 @@ def canonical_ink_mask() -> np.ndarray:
     _, ink = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     _CANONICAL_INK_MASK = ink
     return ink
+
+
+def sunsky_alpha_engine() -> SunskyAlphaEngine | None:
+    global _SUNSKY_ALPHA_ENGINE
+    if _SUNSKY_ALPHA_ENGINE is not None:
+        return _SUNSKY_ALPHA_ENGINE
+    engine = SunskyAlphaEngine(
+        SUNSKY_ALPHA_PATH,
+        TEMPLATE_DIR / "watermark-template.png",
+        min_alignment_score=0.35,
+    )
+    if not engine.alpha_available():
+        return None
+    _SUNSKY_ALPHA_ENGINE = engine
+    return _SUNSKY_ALPHA_ENGINE
+
+
+def sunsky_alpha_meta() -> dict:
+    global _SUNSKY_ALPHA_META
+    if _SUNSKY_ALPHA_META is not None:
+        return _SUNSKY_ALPHA_META
+    if not SUNSKY_ALPHA_META_PATH.exists():
+        _SUNSKY_ALPHA_META = {}
+        return _SUNSKY_ALPHA_META
+    try:
+        _SUNSKY_ALPHA_META = json.loads(SUNSKY_ALPHA_META_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        _SUNSKY_ALPHA_META = {}
+    return _SUNSKY_ALPHA_META
+
+
+def mark_box_tuple(det: Detection) -> tuple[int, int, int, int]:
+    b = det.mark_box
+    return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+
+
+def create_glyph_halo_mask(
+    template_alpha: np.ndarray,
+    mark_box: dict,
+    halo_px_x: int,
+    halo_px_y: int,
+    shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """
+    Scale canonical template alpha into mark_box, then add a controlled
+    low-alpha halo around likely watermark pixels.
+    """
+    b = mark_box
+    ih, iw = template_alpha.shape[:2]
+    target_w = max(24, int(round(b["w"] * 0.94)))
+    target_h = max(8, int(round(target_w * ih / max(iw, 1))))
+    if target_h > b["h"] * 0.95:
+        target_h = max(8, int(round(b["h"] * 0.95)))
+        target_w = max(24, int(round(target_h * iw / max(ih, 1))))
+
+    if shape is None:
+        out_h = max(target_h, int(b["h"]))
+        out_w = max(target_w, int(b["w"]))
+        tx = max(0, int(round((out_w - target_w) / 2)))
+        ty = max(0, int(round((out_h - target_h) / 2)))
+        mask = np.zeros((out_h, out_w), dtype=np.uint8)
+    else:
+        out_h, out_w = shape
+        target_w = min(target_w, out_w)
+        target_h = min(target_h, out_h)
+        tx = int(round(b["x"] + (b["w"] - target_w) / 2))
+        ty = int(round(b["y"] + (b["h"] - target_h) / 2))
+        tx = max(0, min(tx, out_w - target_w))
+        ty = max(0, min(ty, out_h - target_h))
+        mask = np.zeros((out_h, out_w), dtype=np.uint8)
+
+    resized = cv2.resize(template_alpha, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    _, glyph = cv2.threshold(resized, 12, 255, cv2.THRESH_BINARY)
+    mask[ty:ty + target_h, tx:tx + target_w] = glyph
+    if halo_px_x > 0 or halo_px_y > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (max(1, halo_px_x * 2 + 1), max(1, halo_px_y * 2 + 1)),
+        )
+        mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
 
 
 def derived_text_templates(name: str, gray: np.ndarray) -> list[TemplateSpec]:
@@ -1565,6 +1696,8 @@ def create_mask(
     pad_y: int = 5,
     dilate_px: int = 4,
     glyph: bool = False,
+    halo: bool = False,
+    tail_guard: bool = False,
 ) -> tuple[np.ndarray | None, float]:
     img_h, img_w = gray.shape[:2]
     b = det.mark_box
@@ -1576,21 +1709,43 @@ def create_mask(
     if glyph:
         if det.template.startswith(("ocr:", "prior:", "watermark-template")):
             ink = canonical_ink_mask()
-            ih, iw = ink.shape[:2]
-            target_w = max(24, int(round(b["w"] * 0.94)))
-            target_h = max(8, int(round(target_w * ih / max(iw, 1))))
-            if target_h > b["h"] * 0.95:
-                target_h = max(8, int(round(b["h"] * 0.95)))
-                target_w = max(24, int(round(target_h * iw / max(ih, 1))))
-            target_w = min(target_w, img_w)
-            target_h = min(target_h, img_h)
-            resized = cv2.resize(ink, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            _, resized = cv2.threshold(resized, 20, 255, cv2.THRESH_BINARY)
-            tx = int(round(b["x"] + (b["w"] - target_w) / 2))
-            ty = int(round(b["y"] + (b["h"] - target_h) / 2))
-            tx = max(0, min(tx, img_w - target_w))
-            ty = max(0, min(ty, img_h - target_h))
-            mask[ty:ty + target_h, tx:tx + target_w] = resized
+            if halo:
+                mask = create_glyph_halo_mask(
+                    ink,
+                    b,
+                    max(1, dilate_px),
+                    max(1, int(round(dilate_px * 0.45))),
+                    gray.shape[:2],
+                )
+                dilate_px = 0
+            else:
+                ih, iw = ink.shape[:2]
+                target_w = max(24, int(round(b["w"] * 0.94)))
+                target_h = max(8, int(round(target_w * ih / max(iw, 1))))
+                if target_h > b["h"] * 0.95:
+                    target_h = max(8, int(round(b["h"] * 0.95)))
+                    target_w = max(24, int(round(target_h * iw / max(ih, 1))))
+                target_w = min(target_w, img_w)
+                target_h = min(target_h, img_h)
+                resized = cv2.resize(ink, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                _, resized = cv2.threshold(resized, 20, 255, cv2.THRESH_BINARY)
+                tx = int(round(b["x"] + (b["w"] - target_w) / 2))
+                ty = int(round(b["y"] + (b["h"] - target_h) / 2))
+                tx = max(0, min(tx, img_w - target_w))
+                ty = max(0, min(ty, img_h - target_h))
+                mask[ty:ty + target_h, tx:tx + target_w] = resized
+            if tail_guard and det.roi_class != "text_or_label_area":
+                tail_px = int(round(b["w"] * TAIL_EXPAND_RATIO_X))
+                tail_px = max(TAIL_EXPAND_MIN_PX, min(TAIL_EXPAND_MAX_PX, tail_px))
+                tail_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (tail_px * 2 + 1, 3))
+                tail_mask = cv2.dilate(mask, tail_kernel, iterations=1)
+                text_line = np.zeros_like(mask)
+                y_line1 = max(0, b["y"] - max(1, b["h"] // 8))
+                y_line2 = min(img_h, b["y"] + b["h"] + max(1, b["h"] // 8))
+                x_line1 = max(0, b["x"] - tail_px)
+                x_line2 = min(img_w, b["x"] + b["w"] + tail_px)
+                text_line[y_line1:y_line2, x_line1:x_line2] = 255
+                mask = cv2.bitwise_or(mask, cv2.bitwise_and(tail_mask, text_line))
         else:
             roi = gray[y1:y2, x1:x2]
             kernel = max(5, min(35, (max(3, b["h"]) // 2) * 2 + 1))
@@ -1800,6 +1955,522 @@ def cleanup_residual_components_with_inpaint(
     return cleaned, mask, area
 
 
+def _mask_area(mask: np.ndarray | None) -> float:
+    if mask is None or mask.size == 0:
+        return 0.0
+    return float(np.count_nonzero(mask)) / max(1, mask.size)
+
+
+def _expanded_mark_bounds(shape: tuple[int, int], box: dict, pad_x: int, pad_y: int) -> tuple[int, int, int, int]:
+    img_h, img_w = shape[:2]
+    x1 = max(0, int(box["x"]) - pad_x)
+    y1 = max(0, int(box["y"]) - pad_y)
+    x2 = min(img_w, int(box["x"] + box["w"]) + pad_x)
+    y2 = min(img_h, int(box["y"] + box["h"]) + pad_y)
+    return x1, y1, x2, y2
+
+
+def protected_product_edge_mask(original_bgr: np.ndarray, mark_box: dict) -> np.ndarray:
+    gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    pad_x = max(8, int(round(mark_box["w"] * 0.16)))
+    pad_y = max(6, int(round(mark_box["h"] * 0.65)))
+    x1, y1, x2, y2 = _expanded_mark_bounds(gray.shape, mark_box, pad_x, pad_y)
+    roi = gray[y1:y2, x1:x2]
+    if roi.size == 0:
+        return mask
+    edges = cv2.Canny(roi, 55, 150)
+    dark = (roi < 88).astype(np.uint8) * 255
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    dark_lines = np.zeros_like(dark)
+    for idx in range(1, count):
+        _, _, ww, hh, area = stats[idx]
+        if area < 4:
+            continue
+        line_like = ww >= max(8, roi.shape[1] * 0.08) or hh >= max(8, roi.shape[0] * 0.35)
+        if line_like or area >= roi.size * 0.015:
+            dark_lines[labels == idx] = 255
+    protected = cv2.bitwise_or(edges, dark_lines)
+    protected = cv2.dilate(protected, np.ones((3, 3), np.uint8), iterations=1)
+    mask[y1:y2, x1:x2] = protected
+    return mask
+
+
+def _residual_text_component_mask(
+    candidate_gray: np.ndarray,
+    mark_box: dict,
+    roi_class: str,
+) -> tuple[np.ndarray, dict]:
+    img_h, img_w = candidate_gray.shape[:2]
+    pad_x = max(10, int(round(mark_box["w"] * 0.18)))
+    pad_y = max(6, int(round(mark_box["h"] * 0.60)))
+    x1, y1, x2, y2 = _expanded_mark_bounds(candidate_gray.shape, mark_box, pad_x, pad_y)
+    roi = candidate_gray[y1:y2, x1:x2]
+    full = np.zeros_like(candidate_gray)
+    if roi.shape[0] < 8 or roi.shape[1] < 40:
+        return full, {"component_count": 0, "component_area": 0.0, "component_span": 0.0}
+
+    kernel = max(5, min(31, (roi.shape[0] // 2) * 2 + 1))
+    background = cv2.medianBlur(roi, kernel)
+    dev = cv2.absdiff(roi, background)
+    percentile = 86 if roi_class in {"dark_product_surface", "thin_flex_cable", "complex_product_detail", "text_or_label_area"} else 80
+    threshold = max(2.0, float(np.percentile(dev, percentile)))
+    raw = (dev >= threshold).astype(np.uint8) * 255
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(raw, 8)
+    kept = np.zeros_like(raw)
+    xs: list[int] = []
+    total_area = 0
+    components = 0
+    mark_center_y = (mark_box["y"] + mark_box["h"] / 2.0) - y1
+    for idx in range(1, count):
+        xx, yy, ww, hh, area = stats[idx]
+        if area < 2 or area > roi.size * 0.060:
+            continue
+        if hh < 2 or hh > roi.shape[0] * 0.78:
+            continue
+        if ww > roi.shape[1] * 0.34 and area > roi.size * 0.012:
+            continue
+        _, cy = centroids[idx]
+        if abs(float(cy) - mark_center_y) > max(roi.shape[0] * 0.42, mark_box["h"] * 0.90):
+            continue
+        kept[labels == idx] = 255
+        xs.extend([xx, xx + ww])
+        total_area += int(area)
+        components += 1
+
+    if components:
+        kept = cv2.morphologyEx(kept, cv2.MORPH_CLOSE, np.ones((2, 5), np.uint8), iterations=1)
+    full[y1:y2, x1:x2] = kept
+    span = ((max(xs) - min(xs)) / max(1, roi.shape[1])) if xs else 0.0
+    return full, {
+        "component_count": int(components),
+        "component_area": float(total_area / max(1, candidate_gray.size)),
+        "component_span": float(span),
+    }
+
+
+def build_residual_cleanup_mask(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    initial_mask: np.ndarray,
+    mark_box: dict,
+    roi_class: str,
+    detection: Detection,
+    qa_metrics: dict,
+) -> tuple[np.ndarray, dict]:
+    """
+    Build a small second-pass mask only around post-clean residual watermark
+    components. Do not use this for product damage, visible bands, or unknown
+    failure types.
+    """
+    shape = original_bgr.shape[:2]
+    empty = np.zeros(shape, dtype=np.uint8)
+    gate_meta = qa_metrics.get("gate_meta") or {}
+    category = candidate_failure_category(gate_meta)
+    residual_reasons = {"residual_visible", "dot_chain_residual", "post_clean_sunsky_detected", "alpha_template_residual"}
+    reject_reasons = set(gate_meta.get("reject_reasons") or [])
+    if category != "candidate_failed_residual_only" or not (reject_reasons & residual_reasons):
+        return empty, {
+            "eligible": False,
+            "reason": "not_residual_only_failure",
+            "category": category,
+        }
+    if detection.template.startswith("prior:") and detection.confidence < 0.72:
+        return empty, {
+            "eligible": False,
+            "reason": "uncertain_detection",
+            "category": category,
+        }
+    if initial_mask is None or np.count_nonzero(initial_mask) == 0:
+        return empty, {
+            "eligible": False,
+            "reason": "missing_initial_mask",
+            "category": category,
+        }
+
+    risky = roi_class in {"dark_product_surface", "thin_flex_cable", "complex_product_detail", "text_or_label_area"}
+    dilate_x = RISKY_RESIDUAL_CLEANUP_DILATE_X if risky else RESIDUAL_CLEANUP_DILATE_X
+    dilate_y = RISKY_RESIDUAL_CLEANUP_DILATE_Y if risky else RESIDUAL_CLEANUP_DILATE_Y
+    multiplier = RISKY_RESIDUAL_CLEANUP_MAX_AREA_MULTIPLIER if risky else RESIDUAL_CLEANUP_MAX_AREA_MULTIPLIER
+    max_pct = RESIDUAL_CLEANUP_RISKY_AREA_MAX if risky else RESIDUAL_CLEANUP_MAX_AREA_PCT
+    initial_area = _mask_area(initial_mask)
+    area_limit = min(max_pct, max(initial_area * multiplier, initial_area + 0.0012))
+
+    b = mark_box
+    pad_x = max(10, int(round(b["w"] * 0.18)))
+    pad_y = max(6, int(round(b["h"] * 0.60)))
+    x1, y1, x2, y2 = _expanded_mark_bounds(shape, b, pad_x, pad_y)
+    window = np.zeros(shape, dtype=np.uint8)
+    window[y1:y2, x1:x2] = 255
+
+    candidate_gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    original_gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+    component_mask, component_meta = _residual_text_component_mask(candidate_gray, b, roi_class)
+    diff_gray = cv2.absdiff(original_gray, candidate_gray)
+    unchanged_residue = cv2.bitwise_and(component_mask, ((diff_gray < 28).astype(np.uint8) * 255))
+
+    dot_metrics = qa_metrics.get("dot_metrics") or {}
+    dot_mask = dot_metrics.get("component_mask")
+    if isinstance(dot_mask, np.ndarray):
+        dot_mask = cv2.bitwise_and(dot_mask, window)
+    else:
+        dot_mask = empty
+
+    metrics = qa_metrics.get("metrics") or {}
+    ocr_meta = qa_metrics.get("ocr_meta") or {}
+    template_needed = (
+        float(metrics.get("template_residual_score") or 0.0) > FINAL_TEMPLATE_MAX
+        or float(metrics.get("residual_score") or 0.0) > FINAL_RESIDUAL_MAX
+        or bool(ocr_meta.get("ocr_watermark"))
+        or float(ocr_meta.get("ocr_watermark_score") or 0.0) >= OCR_POST_CLEAN_SUSPECT_MIN
+    )
+    template_halo = empty
+    if template_needed:
+        template_halo = create_glyph_halo_mask(
+            canonical_ink_mask(),
+            b,
+            2 if risky else 3,
+            1,
+            shape,
+        )
+        template_halo = cv2.bitwise_and(template_halo, window)
+        if (
+            detection.template.startswith("ocr:")
+            and detection.ocr_watermark_score >= OCR_CROP_LOCALIZE_MIN
+            and roi_class != "text_or_label_area"
+        ) or bool(ocr_meta.get("ocr_watermark")):
+            tail_px = int(round(b["w"] * TAIL_EXPAND_RATIO_X))
+            tail_px = max(TAIL_EXPAND_MIN_PX, min(TAIL_EXPAND_MAX_PX, tail_px))
+            tail = cv2.dilate(template_halo, cv2.getStructuringElement(cv2.MORPH_RECT, (tail_px * 2 + 1, 3)), iterations=1)
+            text_line = np.zeros(shape, dtype=np.uint8)
+            y_line1 = max(0, b["y"] - max(2, b["h"] // 6))
+            y_line2 = min(shape[0], b["y"] + b["h"] + max(2, b["h"] // 6))
+            x_line1 = max(0, b["x"] - tail_px)
+            x_line2 = min(shape[1], b["x"] + b["w"] + tail_px)
+            text_line[y_line1:y_line2, x_line1:x_line2] = 255
+            template_halo = cv2.bitwise_or(template_halo, cv2.bitwise_and(tail, text_line))
+
+    initial_seed = cv2.bitwise_and((initial_mask > 0).astype(np.uint8) * 255, window)
+    seed = cv2.bitwise_or(initial_seed, component_mask)
+    seed = cv2.bitwise_or(seed, unchanged_residue)
+    seed = cv2.bitwise_or(seed, dot_mask)
+    seed = cv2.bitwise_or(seed, template_halo)
+    seed = cv2.bitwise_and(seed, window)
+    if np.count_nonzero(seed) < 4:
+        return empty, {
+            "eligible": False,
+            "reason": "no_residual_components",
+            "category": category,
+            **component_meta,
+        }
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_x * 2 + 1, dilate_y * 2 + 1))
+    cleanup = cv2.dilate(seed, kernel, iterations=1)
+    cleanup = cv2.morphologyEx(cleanup, cv2.MORPH_CLOSE, np.ones((3, 7), np.uint8), iterations=1)
+    cleanup = cv2.bitwise_and(cleanup, window)
+
+    if risky:
+        protected = protected_product_edge_mask(original_bgr, b)
+        # Keep residual pixels on top of strong product edges out of the
+        # second-pass mask. They remain visible in review instead of risking
+        # cable or label destruction.
+        cleanup = cv2.bitwise_and(cleanup, cv2.bitwise_not(protected))
+
+    area = _mask_area(cleanup)
+    if area > area_limit:
+        seed = cv2.bitwise_or(component_mask, dot_mask)
+        if bool(ocr_meta.get("ocr_watermark")):
+            seed = cv2.bitwise_or(seed, template_halo)
+        seed = cv2.bitwise_and(seed, window)
+        small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, dilate_x * 2 - 1), max(1, dilate_y * 2 - 1)))
+        cleanup = cv2.dilate(seed, small_kernel, iterations=1)
+        cleanup = cv2.bitwise_and(cleanup, window)
+        area = _mask_area(cleanup)
+
+    if area <= 0.0 or area > area_limit:
+        return empty, {
+            "eligible": False,
+            "reason": "cleanup_mask_area_limit",
+            "category": category,
+            "cleanup_area_pct": area * 100,
+            "area_limit_pct": area_limit * 100,
+            **component_meta,
+        }
+
+    return cleanup, {
+        "eligible": True,
+        "reason": "residual_evidence_mask",
+        "category": category,
+        "cleanup_area_pct": area * 100,
+        "area_limit_pct": area_limit * 100,
+        "initial_mask_area_pct": initial_area * 100,
+        "risky_roi": bool(risky),
+        "dilate_x": dilate_x,
+        "dilate_y": dilate_y,
+        "template_halo_used": bool(template_needed),
+        "dot_component_area_pct": _mask_area(dot_mask) * 100,
+        **component_meta,
+    }
+
+
+def _context_ring(mask_shape: tuple[int, int], mark_box: dict, mask: np.ndarray, pad_x: int, pad_y: int) -> np.ndarray:
+    x1, y1, x2, y2 = _expanded_mark_bounds(mask_shape, mark_box, pad_x, pad_y)
+    window = np.zeros(mask_shape, dtype=np.uint8)
+    window[y1:y2, x1:x2] = 255
+    expanded = cv2.dilate((mask > 0).astype(np.uint8) * 255, np.ones((7, 15), np.uint8), iterations=1)
+    return cv2.bitwise_and(window, cv2.bitwise_not(expanded))
+
+
+def _blend_repair(base_bgr: np.ndarray, fill_bgr: np.ndarray, mask: np.ndarray, sigma: float = 0.85) -> np.ndarray:
+    alpha = cv2.GaussianBlur((mask > 0).astype(np.uint8) * 255, (0, 0), sigma).astype(np.float32)[:, :, None] / 255.0
+    repaired = base_bgr.astype(np.float32) * (1.0 - alpha) + fill_bgr.astype(np.float32) * alpha
+    return np.uint8(np.clip(repaired, 0, 255))
+
+
+def white_or_near_white_row_fill(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    cleanup_mask: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    if cleanup_mask is None or np.count_nonzero(cleanup_mask) < 4:
+        return None, {"operator": "white_or_near_white_row_fill", "reason": "empty_mask"}
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    b = det.mark_box
+    pad_x = max(18, int(round(b["w"] * 0.22)))
+    pad_y = max(14, int(round(b["h"] * 1.20)))
+    ring = _context_ring(gray.shape, b, cleanup_mask, pad_x, pad_y)
+    bright_ring = cv2.bitwise_and(ring, ((gray >= 190).astype(np.uint8) * 255))
+    if np.count_nonzero(bright_ring) < 24:
+        return None, {"operator": "white_or_near_white_row_fill", "reason": "insufficient_bright_context"}
+
+    fill = candidate_bgr.astype(np.float32).copy()
+    ys, xs = np.where(cleanup_mask > 0)
+    y_min, y_max = int(ys.min()), int(ys.max())
+    ring_pixels = candidate_bgr[bright_ring > 0].reshape(-1, 3)
+    global_fill = np.median(ring_pixels, axis=0).astype(np.float32)
+    global_noise = np.clip(np.std(ring_pixels, axis=0), 0.0, 2.0)
+    for y in range(y_min, y_max + 1):
+        row1 = max(0, y - 2)
+        row2 = min(gray.shape[0], y + 3)
+        row_ctx = bright_ring[row1:row2, :]
+        pixels = candidate_bgr[row1:row2, :][row_ctx > 0]
+        row_fill = np.median(pixels.reshape(-1, 3), axis=0).astype(np.float32) if pixels.size >= 18 else global_fill
+        cols = np.where(cleanup_mask[y, :] > 0)[0]
+        if not len(cols):
+            continue
+        pseudo = (((cols * 17 + y * 31 + b["x"] * 7) % 23) - 11).astype(np.float32)[:, None] / 11.0
+        fill[y, cols] = row_fill.reshape(1, 3) + pseudo * global_noise.reshape(1, 3)
+
+    repaired = _blend_repair(candidate_bgr, np.uint8(np.clip(fill, 0, 255)), cleanup_mask, sigma=0.75)
+    return repaired, {
+        "operator": "white_or_near_white_row_fill",
+        "repair_mask_area_pct": _mask_area(cleanup_mask) * 100,
+        "context_pixels": int(np.count_nonzero(bright_ring)),
+    }
+
+
+def dark_surface_low_alpha_scrub(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    cleanup_mask: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    if cleanup_mask is None or np.count_nonzero(cleanup_mask) < 4:
+        return None, {"operator": "dark_surface_low_alpha_scrub", "reason": "empty_mask"}
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    b = det.mark_box
+    pad_x = max(12, int(round(b["w"] * 0.18)))
+    pad_y = max(8, int(round(b["h"] * 0.85)))
+    ring = _context_ring(gray.shape, b, cleanup_mask, pad_x, pad_y)
+    dark_ring = cv2.bitwise_and(ring, ((gray <= 170).astype(np.uint8) * 255))
+    protected = protected_product_edge_mask(original_bgr, b)
+    allowed = cv2.bitwise_and(cleanup_mask, cv2.bitwise_not(protected))
+    if np.count_nonzero(allowed) < 4:
+        return None, {"operator": "dark_surface_low_alpha_scrub", "reason": "protected_all_residual_pixels"}
+    if np.count_nonzero(dark_ring) < 18:
+        dark_ring = ring
+    pixels = candidate_bgr[dark_ring > 0].reshape(-1, 3)
+    if pixels.size == 0:
+        return None, {"operator": "dark_surface_low_alpha_scrub", "reason": "insufficient_context"}
+    fill_color = np.median(pixels, axis=0).astype(np.float32)
+    noise_sigma = np.clip(np.std(pixels, axis=0), 0.0, 3.5)
+    yy, xx = np.indices(gray.shape)
+    pseudo = (((xx * 19 + yy * 23 + b["y"] * 11) % 29) - 14).astype(np.float32) / 14.0
+    fill = np.zeros_like(candidate_bgr, dtype=np.float32)
+    fill[:, :] = fill_color.reshape(1, 1, 3) + pseudo[:, :, None] * noise_sigma.reshape(1, 1, 3)
+    repaired = _blend_repair(candidate_bgr, np.uint8(np.clip(fill, 0, 255)), allowed, sigma=0.70)
+    return repaired, {
+        "operator": "dark_surface_low_alpha_scrub",
+        "dark_surface_scrub_used": True,
+        "repair_mask_area_pct": _mask_area(allowed) * 100,
+        "protected_edge_area_pct": _mask_area(protected) * 100,
+    }
+
+
+def thin_flex_cable_protected_cleanup(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    cleanup_mask: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    if cleanup_mask is None or np.count_nonzero(cleanup_mask) < 4:
+        return None, {"operator": "thin_flex_cable_protected_cleanup", "reason": "empty_mask"}
+    b = det.mark_box
+    protected = protected_product_edge_mask(original_bgr, b)
+    allowed = cv2.bitwise_and(cleanup_mask, cv2.bitwise_not(cv2.dilate(protected, np.ones((3, 3), np.uint8), iterations=1)))
+    if np.count_nonzero(allowed) < 4:
+        return None, {"operator": "thin_flex_cable_protected_cleanup", "reason": "protected_all_residual_pixels"}
+    allowed = cv2.morphologyEx(allowed, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8), iterations=1)
+    if np.count_nonzero(allowed) < 4:
+        return None, {"operator": "thin_flex_cable_protected_cleanup", "reason": "no_low_contrast_residue"}
+    repaired = cv2.inpaint(candidate_bgr, allowed, 2, cv2.INPAINT_NS)
+    orig_gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+    rep_gray = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)
+    orig_edges = cv2.bitwise_and(cv2.Canny(orig_gray, 55, 150), protected)
+    rep_edges = cv2.bitwise_and(cv2.Canny(rep_gray, 55, 150), protected)
+    protected_edge_loss = 1.0 - (
+        np.count_nonzero(cv2.bitwise_and(orig_edges, rep_edges)) / max(1, np.count_nonzero(orig_edges))
+    )
+    x1, y1, x2, y2 = _expanded_mark_bounds(orig_gray.shape, b, max(8, b["w"] // 8), max(6, b["h"] // 2))
+    orig_sil = orig_gray[y1:y2, x1:x2] < 95
+    rep_sil = rep_gray[y1:y2, x1:x2] < 95
+    cable_silhouette_delta = float(np.mean(orig_sil != rep_sil)) if orig_sil.size else 0.0
+    return repaired, {
+        "operator": "thin_flex_cable_protected_cleanup",
+        "repair_mask_area_pct": _mask_area(allowed) * 100,
+        "protected_edge_loss": float(protected_edge_loss),
+        "cable_silhouette_delta": cable_silhouette_delta,
+    }
+
+
+def solid_color_surface_fill(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    cleanup_mask: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    if cleanup_mask is None or np.count_nonzero(cleanup_mask) < 4:
+        return None, {"operator": "solid_color_surface_fill", "reason": "empty_mask"}
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    b = det.mark_box
+    pad_x = max(16, int(round(b["w"] * 0.22)))
+    pad_y = max(12, int(round(b["h"] * 1.10)))
+    ring = _context_ring(gray.shape, b, cleanup_mask, pad_x, pad_y)
+    if np.count_nonzero(ring) < 36:
+        return None, {"operator": "solid_color_surface_fill", "reason": "insufficient_context"}
+    ring_gray = gray[ring > 0]
+    edge_density = float(np.mean(cv2.Canny(gray, 55, 150)[ring > 0] > 0)) if ring_gray.size else 1.0
+    ring_pixels = candidate_bgr[ring > 0].reshape(-1, 3)
+    color_std = float(np.mean(np.std(ring_pixels, axis=0))) if ring_pixels.size else 255.0
+    if edge_density > 0.12 or color_std > 46.0:
+        return None, {
+            "operator": "solid_color_surface_fill",
+            "reason": "not_solid_color_plane",
+            "edge_density": edge_density,
+            "color_std": color_std,
+        }
+
+    ys, xs = np.where(ring > 0)
+    if len(xs) > 5000:
+        step = max(1, len(xs) // 5000)
+        xs = xs[::step]
+        ys = ys[::step]
+    design = np.stack([xs.astype(np.float32), ys.astype(np.float32), np.ones_like(xs, dtype=np.float32)], axis=1)
+    fill = candidate_bgr.astype(np.float32).copy()
+    mask_ys, mask_xs = np.where(cleanup_mask > 0)
+    mask_design = np.stack(
+        [mask_xs.astype(np.float32), mask_ys.astype(np.float32), np.ones_like(mask_xs, dtype=np.float32)],
+        axis=1,
+    )
+    for channel in range(3):
+        values = candidate_bgr[ys, xs, channel].astype(np.float32)
+        coeff, *_ = np.linalg.lstsq(design, values, rcond=None)
+        predicted = mask_design @ coeff
+        fill[mask_ys, mask_xs, channel] = predicted
+    repaired = _blend_repair(candidate_bgr, np.uint8(np.clip(fill, 0, 255)), cleanup_mask, sigma=0.80)
+    return repaired, {
+        "operator": "solid_color_surface_fill",
+        "repair_mask_area_pct": _mask_area(cleanup_mask) * 100,
+        "edge_density": edge_density,
+        "color_std": color_std,
+    }
+
+
+def repeated_object_neighbor_clone(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    cleanup_mask: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    if cleanup_mask is None or np.count_nonzero(cleanup_mask) < 4:
+        return None, {"operator": "repeated_object_neighbor_clone", "reason": "empty_mask"}
+    ys, xs = np.where(cleanup_mask > 0)
+    x1, x2 = max(0, int(xs.min()) - 6), min(candidate_bgr.shape[1], int(xs.max()) + 7)
+    y1, y2 = max(0, int(ys.min()) - 6), min(candidate_bgr.shape[0], int(ys.max()) + 7)
+    patch = candidate_bgr[y1:y2, x1:x2]
+    if patch.shape[0] < 10 or patch.shape[1] < 10 or patch.size > candidate_bgr.size * 0.08:
+        return None, {"operator": "repeated_object_neighbor_clone", "reason": "patch_size_not_supported"}
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    tpl = cv2.Canny(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY), 45, 130)
+    scene = cv2.Canny(gray, 45, 130)
+    if tpl.shape[0] >= scene.shape[0] or tpl.shape[1] >= scene.shape[1]:
+        return None, {"operator": "repeated_object_neighbor_clone", "reason": "patch_larger_than_scene"}
+    result = cv2.matchTemplate(scene, tpl, cv2.TM_CCOEFF_NORMED)
+    ignore_x1 = max(0, x1 - patch.shape[1])
+    ignore_y1 = max(0, y1 - patch.shape[0])
+    ignore_x2 = min(result.shape[1], x2 + patch.shape[1])
+    ignore_y2 = min(result.shape[0], y2 + patch.shape[0])
+    result[ignore_y1:ignore_y2, ignore_x1:ignore_x2] = -1.0
+    _, score, _, loc = cv2.minMaxLoc(result)
+    if score < 0.94:
+        return None, {"operator": "repeated_object_neighbor_clone", "reason": "low_similarity", "similarity": float(score)}
+    sx, sy = loc
+    donor = candidate_bgr[sy:sy + patch.shape[0], sx:sx + patch.shape[1]]
+    if donor.shape != patch.shape:
+        return None, {"operator": "repeated_object_neighbor_clone", "reason": "invalid_donor"}
+    fill = candidate_bgr.copy()
+    local_mask = cleanup_mask[y1:y2, x1:x2]
+    fill[y1:y2, x1:x2][local_mask > 0] = donor[local_mask > 0]
+    repaired = _blend_repair(candidate_bgr, fill, cleanup_mask, sigma=0.65)
+    return repaired, {
+        "operator": "repeated_object_neighbor_clone",
+        "repair_mask_area_pct": _mask_area(cleanup_mask) * 100,
+        "similarity": float(score),
+        "donor_box": {"x": int(sx), "y": int(sy), "w": int(patch.shape[1]), "h": int(patch.shape[0])},
+    }
+
+
+def roi_specific_repair_candidates(
+    original_bgr: np.ndarray,
+    candidate_bgr: np.ndarray,
+    cleanup_mask: np.ndarray,
+    det: Detection,
+) -> list[tuple[str, np.ndarray, np.ndarray, dict]]:
+    operators = []
+    if det.roi_class in {"plain_white", "near_white", "low_texture_background"}:
+        operators.append(white_or_near_white_row_fill)
+    if det.roi_class in {"dark_product_surface"}:
+        operators.append(dark_surface_low_alpha_scrub)
+    if det.roi_class == "thin_flex_cable":
+        operators.append(thin_flex_cable_protected_cleanup)
+    if det.roi_class in {"low_texture_background", "simple_product_surface", "near_white", "plain_white", "dark_product_surface"}:
+        operators.append(solid_color_surface_fill)
+    operators.append(repeated_object_neighbor_clone)
+
+    repaired: list[tuple[str, np.ndarray, np.ndarray, dict]] = []
+    seen = set()
+    for operator in operators:
+        if operator.__name__ in seen:
+            continue
+        seen.add(operator.__name__)
+        image, meta = operator(original_bgr, candidate_bgr, cleanup_mask, det)
+        if image is None:
+            continue
+        repaired.append((operator.__name__, image, cleanup_mask, meta))
+    return repaired
+
+
 def near_area_background_fill_repair(
     img: np.ndarray,
     gray: np.ndarray,
@@ -1887,7 +2558,7 @@ def evaluate_cleaned_output(
     det: Detection,
     templates: list[TemplateSpec] | None,
     ocr_reader,
-) -> tuple[np.ndarray, dict, int | None, dict, dict, dict, dict, dict]:
+) -> tuple[np.ndarray, dict, int | None, dict, dict, dict, dict, dict, dict]:
     cgray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
     metrics = residual_quality_metrics(cgray, det, templates)
     post_count = post_clean_detection_count(candidate, cgray, templates)
@@ -1895,8 +2566,9 @@ def evaluate_cleaned_output(
     dot_metrics = residual_component_metrics(cgray, det)
     band_metrics = detect_rectangular_band_visibility(original, candidate, mask)
     product_metrics = detect_product_damage_v13(original, candidate, mask, det)
-    gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics)
-    return cgray, metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics, gate_meta
+    alpha_metrics = alpha_quality_metrics(original, candidate, det)
+    gate_meta = final_publish_gate(metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics, alpha_metrics)
+    return cgray, metrics, post_count, ocr_meta, dot_metrics, band_metrics, product_metrics, alpha_metrics, gate_meta
 
 
 def detect_rectangular_band_visibility(original: np.ndarray, candidate: np.ndarray, mask: np.ndarray | None) -> dict:
@@ -1997,6 +2669,27 @@ def detect_product_damage_v13(original: np.ndarray, candidate: np.ndarray, mask:
     }
 
 
+def alpha_quality_metrics(original: np.ndarray, candidate: np.ndarray, det: Detection) -> dict:
+    engine = sunsky_alpha_engine()
+    if engine is None or not engine.alpha_available() or engine.alpha is None:
+        return {
+            "alpha_checked": False,
+            "alpha_template_residual_before": 0.0,
+            "alpha_template_residual_after": 0.0,
+            "alpha_residual_reduction": 0.0,
+        }
+    mark = mark_box_tuple(det)
+    before = score_alpha_residual(original, mark, engine.alpha)
+    after = score_alpha_residual(candidate, mark, engine.alpha)
+    reduction = 0.0 if before <= 1e-6 else max(0.0, (before - after) / before)
+    return {
+        "alpha_checked": True,
+        "alpha_template_residual_before": float(before),
+        "alpha_template_residual_after": float(after),
+        "alpha_residual_reduction": float(reduction),
+    }
+
+
 def final_publish_gate(
     metrics: dict,
     post_count: int | None,
@@ -2004,8 +2697,10 @@ def final_publish_gate(
     dot_metrics: dict,
     band_metrics: dict,
     product_metrics: dict | None = None,
+    alpha_metrics: dict | None = None,
 ) -> dict:
     product_metrics = product_metrics or {"product_gate_fail": False}
+    alpha_metrics = alpha_metrics or {"alpha_checked": False}
     required = ["residual_score", "template_residual_score", "post_text_score", "post_text_components"]
     metrics_valid = all(isinstance(metrics.get(key), (int, float)) for key in required)
     residual_pass = (
@@ -2023,6 +2718,19 @@ def final_publish_gate(
     dot_pass = not bool(dot_metrics.get("dot_chain_fail"))
     band_pass = not bool(band_metrics.get("band_gate_fail"))
     product_pass = not bool(product_metrics.get("product_gate_fail"))
+    alpha_checked = bool(alpha_metrics.get("alpha_checked"))
+    alpha_pass = True
+    if alpha_checked:
+        alpha_before = float(alpha_metrics.get("alpha_template_residual_before") or 0.0)
+        alpha_after = float(alpha_metrics.get("alpha_template_residual_after") or 0.0)
+        alpha_reduction = float(alpha_metrics.get("alpha_residual_reduction") or 0.0)
+        alpha_pass = (
+            alpha_after <= FINAL_ALPHA_TEMPLATE_MAX
+            and (
+                alpha_before <= FINAL_ALPHA_TEMPLATE_MAX
+                or alpha_reduction >= MIN_ALPHA_RESIDUAL_REDUCTION
+            )
+        )
     reject_reasons = []
     if not metrics_valid:
         reject_reasons.append("missing_required_qa_metric")
@@ -2036,7 +2744,9 @@ def final_publish_gate(
         reject_reasons.append("product_damage")
     if not sunsky_check_pass:
         reject_reasons.append("post_clean_sunsky_detected")
-    publish_ok = metrics_valid and residual_pass and sunsky_check_pass and dot_pass and band_pass and product_pass
+    if not alpha_pass:
+        reject_reasons.append("alpha_template_residual")
+    publish_ok = metrics_valid and residual_pass and sunsky_check_pass and dot_pass and band_pass and product_pass and alpha_pass
     return {
         "publish_ok": bool(publish_ok),
         "status": "cleaned" if publish_ok else "needs_manual",
@@ -2048,6 +2758,63 @@ def final_publish_gate(
         "dot_chain_pass": bool(dot_pass),
         "band_pass": bool(band_pass),
         "product_gate_pass": bool(product_pass),
+        "alpha_template_pass": bool(alpha_pass),
+    }
+
+
+def candidate_failure_category(gate_meta: dict | None) -> str:
+    if not gate_meta:
+        return "candidate_failed_metrics_invalid"
+    if gate_meta.get("publish_ok"):
+        return "candidate_passed"
+    reasons = set(gate_meta.get("reject_reasons") or [])
+    if "missing_required_qa_metric" in reasons:
+        return "candidate_failed_metrics_invalid"
+    if "product_damage" in reasons:
+        return "candidate_failed_product_damage"
+    if "visible_rectangular_band" in reasons:
+        return "candidate_failed_band"
+    residual_reasons = {"residual_visible", "dot_chain_residual", "post_clean_sunsky_detected"}
+    if reasons and reasons.issubset(residual_reasons):
+        return "candidate_failed_residual_only"
+    if reasons & residual_reasons and not (reasons - residual_reasons):
+        return "candidate_failed_residual_only"
+    return "candidate_failed_detection"
+
+
+def final_blocker_type(gate_meta: dict | None) -> str:
+    category = candidate_failure_category(gate_meta)
+    return {
+        "candidate_passed": "none",
+        "candidate_failed_residual_only": "residual_watermark",
+        "candidate_failed_band": "visible_band",
+        "candidate_failed_product_damage": "product_damage",
+        "candidate_failed_detection": "detection_or_policy",
+        "candidate_failed_metrics_invalid": "metrics_invalid",
+    }.get(category, "unknown")
+
+
+def candidate_trace(candidate: RepairCandidate) -> dict:
+    gate_meta = candidate.gate_meta or {}
+    return {
+        "candidate_id": candidate.id,
+        "strategy": candidate.strategy,
+        "category": candidate.category,
+        "rank_score": round(float(candidate.rank_score), 5),
+        "residual_score": round(float(candidate.residual), 4),
+        "template_residual_score": round(float(candidate.template_residual), 4),
+        "sharpness_ratio": round(float(candidate.sharpness_ratio), 4),
+        "mask_area_pct": round(float(candidate.mask_area) * 100, 3),
+        "second_pass": bool(candidate.second_pass),
+        "second_pass_strategy": candidate.second_pass_strategy,
+        "second_pass_mask_area_pct": round(float(candidate.second_pass_mask_area) * 100, 3),
+        "reject_reasons": list(gate_meta.get("reject_reasons") or []),
+        "publish_ok": bool(gate_meta.get("publish_ok")),
+        "band_fail": bool((candidate.band_metrics or {}).get("band_gate_fail")),
+        "product_fail": bool((candidate.product_metrics or {}).get("product_gate_fail")),
+        "post_clean_detection_count": candidate.post_count,
+        "post_clean_ocr_score": round(float((candidate.gate_meta or {}).get("post_clean_ocr_score") or 0.0), 4),
+        "post_text_components": int(candidate.metrics.get("post_text_components") or 0),
     }
 
 
@@ -2181,6 +2948,70 @@ def clean_image(
     candidates = []
     first_mask = None
     first_area = 0.0
+    alpha_candidate_count = 0
+    alpha_asset_used = False
+
+    engine = sunsky_alpha_engine()
+    alpha_allowed = (
+        engine is not None
+        and engine.alpha_available()
+        and det.mark_box
+        and (det.mask_area_pct / 100.0) <= MAX_MASK_AREA
+        and not (det.template.startswith("prior:") and det.confidence < 0.72)
+    )
+    if alpha_allowed and engine is not None:
+        alpha_asset_used = True
+        for idx, alpha_candidate in enumerate(
+            engine.reverse_alpha_candidates(img, mark_box_tuple(det), roi_class=det.roi_class)
+        ):
+            alpha_mask = (alpha_candidate.alpha_map >= ALPHA_FLOOR).astype(np.uint8) * 255
+            alpha_area = float(np.count_nonzero(alpha_mask)) / max(1, alpha_mask.size)
+            area_limit = RESIDUAL_CLEANUP_RISKY_AREA_MAX if risky_product_roi else PILOT_MASK_AREA
+            if alpha_area <= 0.0 or alpha_area > area_limit:
+                continue
+            cgray = cv2.cvtColor(alpha_candidate.image, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, alpha_mask) / max(laplacian_var(gray, alpha_mask), 1e-6)
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            cost = (
+                min(1.0, residual) * 3.0
+                + min(1.0, template_residual) * 3.0
+                + float(alpha_candidate.residual_probe_score) * 2.0
+                + metrics["post_text_components"] * 0.20
+                + alpha_area * 5.0
+                - min(0.35, float(alpha_candidate.alignment_score) * 0.20)
+            )
+            extra = {
+                "alpha_engine_used": True,
+                "alpha_candidate_index": idx,
+                "alpha_alignment_score": float(alpha_candidate.alignment_score),
+                "alpha_best_gain": float(alpha_candidate.alpha_gain),
+                "alpha_best_logo_bgr": [float(v) for v in alpha_candidate.logo_bgr],
+                "alpha_residual_probe_score": float(alpha_candidate.residual_probe_score),
+                "thin_residual_inpaint": alpha_candidate.name.endswith("_thin_ns"),
+                "alpha_bbox": {
+                    "x": int(alpha_candidate.glyph_bbox[0]),
+                    "y": int(alpha_candidate.glyph_bbox[1]),
+                    "w": int(alpha_candidate.glyph_bbox[2]),
+                    "h": int(alpha_candidate.glyph_bbox[3]),
+                },
+            }
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                alpha_area,
+                alpha_candidate.name,
+                alpha_candidate.image,
+                alpha_mask,
+                metrics,
+                extra,
+            ))
+            alpha_candidate_count += 1
+            if alpha_candidate_count >= 12:
+                break
 
     for variant, pad_x, pad_y, dilate_px, radius, glyph in variants:
         mask, area = create_mask(gray, det, img=img, pad_x=pad_x, pad_y=pad_y, dilate_px=dilate_px, glyph=glyph)
@@ -2222,6 +3053,7 @@ def clean_image(
                 near_candidate,
                 near_mask,
                 metrics,
+                {},
             ))
         for method_name, method in (("telea", cv2.INPAINT_TELEA), ("ns", cv2.INPAINT_NS)):
             candidate = cv2.inpaint(img, mask, radius, method)
@@ -2250,6 +3082,7 @@ def clean_image(
                 candidate,
                 mask,
                 metrics,
+                {},
             ))
 
     if not candidates:
@@ -2262,8 +3095,10 @@ def clean_image(
     candidates.sort(reverse=True, key=lambda item: item[0])
     selected = candidates[0]
     selected_eval: dict | None = None
-    for cand in candidates[:10]:
-        _, cresidual, ctemplate_residual, cratio, carea, cname, cbest, cmask, cmetrics = cand
+    candidate_traces = []
+    selected_candidate_id = "cand_00"
+    for cand in candidates[:MAX_TOTAL_REPAIR_CANDIDATES]:
+        _, cresidual, ctemplate_residual, cratio, carea, cname, cbest, cmask, cmetrics, cextra = cand
         (
             cgray,
             cmetrics,
@@ -2272,22 +3107,44 @@ def clean_image(
             cdot_metrics,
             cband_metrics,
             cproduct_metrics,
+            calpha_metrics,
             cgate_meta,
         ) = evaluate_cleaned_output(img, cbest, cmask, det, templates, ocr_reader)
+        category = candidate_failure_category(cgate_meta)
+        trace_id = f"cand_{len(candidate_traces):02d}"
+        candidate_traces.append({
+            "candidate_id": trace_id,
+            "strategy": cname,
+            "category": category,
+            "rank_score": round(float(cand[0]), 5),
+            "residual_score": round(float(cmetrics["residual_score"]), 4),
+            "template_residual_score": round(float(cmetrics["template_residual_score"]), 4),
+            "post_clean_ocr_score": round(float(cgate_meta.get("post_clean_ocr_score") or 0.0), 4),
+            "post_text_components": int(cmetrics.get("post_text_components") or 0),
+            "dot_chain_score": round(float(cdot_metrics.get("dot_chain_score") or 0.0), 4),
+            "visible_band_score": round(float(cband_metrics.get("visible_band_score") or 0.0), 4),
+            "product_blob_score": round(float(cproduct_metrics.get("product_blob_score") or 0.0), 4),
+            "alpha_alignment_score": round(float(cextra.get("alpha_alignment_score") or 0.0), 4),
+            "alpha_template_residual_after": round(float(calpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
+            "reject_reasons": list(cgate_meta.get("reject_reasons") or []),
+        })
         if cgate_meta["publish_ok"]:
             selected = cand
+            selected_candidate_id = trace_id
             selected_eval = {
                 "gray": cgray,
+                "metrics": cmetrics,
                 "post_count": cpost_count,
                 "ocr_meta": cocr_meta,
                 "dot_metrics": cdot_metrics,
                 "band_metrics": cband_metrics,
                 "product_metrics": cproduct_metrics,
+                "alpha_metrics": calpha_metrics,
                 "gate_meta": cgate_meta,
             }
             break
 
-    _, residual, template_residual, ratio, area, name, best, mask, metrics = selected
+    _, residual, template_residual, ratio, area, name, best, mask, metrics, selected_extra = selected
 
     lama_reason = ""
     if ENABLE_LAMA_ESCALATION and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
@@ -2312,15 +3169,20 @@ def clean_image(
                 metrics = lmetrics
                 best = lama
                 name = "lama"
+                selected_extra = {}
                 selected_eval = None
 
     if selected_eval is not None:
         best_gray = selected_eval["gray"]
+        metrics = selected_eval["metrics"]
+        residual = metrics["residual_score"]
+        template_residual = metrics["template_residual_score"]
         post_count = selected_eval["post_count"]
         ocr_meta = selected_eval["ocr_meta"]
         dot_metrics = selected_eval["dot_metrics"]
         band_metrics = selected_eval["band_metrics"]
         product_metrics = selected_eval["product_metrics"]
+        alpha_metrics = selected_eval["alpha_metrics"]
         gate_meta = selected_eval["gate_meta"]
     else:
         (
@@ -2331,6 +3193,7 @@ def clean_image(
             dot_metrics,
             band_metrics,
             product_metrics,
+            alpha_metrics,
             gate_meta,
         ) = evaluate_cleaned_output(img, best, mask, det, templates, ocr_reader)
     broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
@@ -2345,6 +3208,7 @@ def clean_image(
         and (
             "dot_chain_residual" in cleanup_reasons
             or "residual_visible" in cleanup_reasons
+            or "alpha_template_residual" in cleanup_reasons
             or bool(ocr_meta.get("ocr_watermark"))
         )
         and "product_damage" not in cleanup_reasons
@@ -2382,6 +3246,7 @@ def clean_image(
                 cleanup_dot_metrics,
                 cleanup_band_metrics,
                 cleanup_product_metrics,
+                cleanup_alpha_metrics,
                 cleanup_gate,
             ) = evaluate_cleaned_output(img, cleanup, combined_cleanup_mask, det, templates, ocr_reader)
             cleanup_score = (
@@ -2404,6 +3269,7 @@ def clean_image(
                 dot_metrics = cleanup_dot_metrics
                 band_metrics = cleanup_band_metrics
                 product_metrics = cleanup_product_metrics
+                alpha_metrics = cleanup_alpha_metrics
                 gate_meta = cleanup_gate
                 mask = combined_cleanup_mask
                 area = float(np.count_nonzero(mask)) / max(1, mask.size)
@@ -2454,6 +3320,7 @@ def clean_image(
         "dot_chain_pass": gate_meta["dot_chain_pass"],
         "band_pass": gate_meta["band_pass"],
         "product_gate_pass": gate_meta["product_gate_pass"],
+        "alpha_template_pass": gate_meta.get("alpha_template_pass"),
         "dot_chain_score": round(float(dot_metrics["dot_chain_score"]), 4),
         "dot_component_count": dot_metrics["dot_component_count"],
         "dot_horizontal_span": round(float(dot_metrics["dot_horizontal_span"]), 4),
@@ -2468,6 +3335,21 @@ def clean_image(
         "cleanup_attempted": cleanup_attempted,
         "cleanup_strategy": cleanup_strategy,
         "cleanup_mask_area_pct": round(cleanup_mask_area * 100, 3),
+        "candidate_count": len(candidates),
+        "best_candidate_id": selected_candidate_id,
+        "candidate_gate_trace": candidate_traces[:TOP_K_CANDIDATES],
+        "final_blocker_type": final_blocker_type(gate_meta),
+        "alpha_engine_used": bool(selected_extra.get("alpha_engine_used")),
+        "alpha_asset": str(SUNSKY_ALPHA_PATH.relative_to(PROJECT_ROOT)) if SUNSKY_ALPHA_PATH.exists() else "",
+        "alpha_asset_version": str(sunsky_alpha_meta().get("method") or ""),
+        "alpha_alignment_score": round(float(selected_extra.get("alpha_alignment_score") or 0.0), 4),
+        "alpha_candidate_count": alpha_candidate_count,
+        "alpha_best_gain": round(float(selected_extra.get("alpha_best_gain") or 0.0), 4),
+        "alpha_best_logo_bgr": selected_extra.get("alpha_best_logo_bgr") or [],
+        "alpha_template_residual_before": round(float(alpha_metrics.get("alpha_template_residual_before") or 0.0), 4),
+        "alpha_template_residual_after": round(float(alpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
+        "alpha_residual_reduction": round(float(alpha_metrics.get("alpha_residual_reduction") or 0.0), 4),
+        "thin_residual_inpaint": bool(selected_extra.get("thin_residual_inpaint")),
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
         meta.update({
@@ -2541,6 +3423,36 @@ def clean_all_detections(
         for item in details
         if isinstance(item.get("post_clean_ocr_score"), (int, float))
     ]
+    alpha_alignment_scores = [
+        float(item["alpha_alignment_score"])
+        for item in details
+        if isinstance(item.get("alpha_alignment_score"), (int, float))
+    ]
+    alpha_before_scores = [
+        float(item["alpha_template_residual_before"])
+        for item in details
+        if isinstance(item.get("alpha_template_residual_before"), (int, float))
+    ]
+    alpha_after_scores = [
+        float(item["alpha_template_residual_after"])
+        for item in details
+        if isinstance(item.get("alpha_template_residual_after"), (int, float))
+    ]
+    alpha_reductions = [
+        float(item["alpha_residual_reduction"])
+        for item in details
+        if isinstance(item.get("alpha_residual_reduction"), (int, float))
+    ]
+    alpha_candidate_counts = [
+        int(item["alpha_candidate_count"])
+        for item in details
+        if isinstance(item.get("alpha_candidate_count"), int)
+    ]
+    repair_candidate_counts = [
+        int(item["candidate_count"])
+        for item in details
+        if isinstance(item.get("candidate_count"), int)
+    ]
     sunsky_check_passes = [
         bool(item["sunsky_check_pass"])
         for item in details
@@ -2572,6 +3484,20 @@ def clean_all_detections(
         "post_text_components": max(text_components) if text_components else 0,
         "post_clean_ocr_score": round(max(post_clean_ocr_scores), 4) if post_clean_ocr_scores else None,
         "sunsky_check_pass": all(sunsky_check_passes) if sunsky_check_passes else None,
+        "alpha_engine_used": any(bool(item.get("alpha_engine_used")) for item in details),
+        "alpha_asset": str(SUNSKY_ALPHA_PATH.relative_to(PROJECT_ROOT)) if SUNSKY_ALPHA_PATH.exists() else "",
+        "alpha_asset_version": str(sunsky_alpha_meta().get("method") or ""),
+        "alpha_alignment_score": round(max(alpha_alignment_scores), 4) if alpha_alignment_scores else 0.0,
+        "alpha_candidate_count": sum(alpha_candidate_counts) if alpha_candidate_counts else 0,
+        "alpha_best_gain": next((item.get("alpha_best_gain") for item in details if item.get("alpha_best_gain")), 0.0),
+        "alpha_best_logo_bgr": next((item.get("alpha_best_logo_bgr") for item in details if item.get("alpha_best_logo_bgr")), []),
+        "alpha_template_residual_before": round(max(alpha_before_scores), 4) if alpha_before_scores else 0.0,
+        "alpha_template_residual_after": round(max(alpha_after_scores), 4) if alpha_after_scores else 0.0,
+        "alpha_residual_reduction": round(max(alpha_reductions), 4) if alpha_reductions else 0.0,
+        "thin_residual_inpaint": any(bool(item.get("thin_residual_inpaint")) for item in details),
+        "candidate_count": sum(repair_candidate_counts) if repair_candidate_counts else 0,
+        "best_candidate_id": next((str(item.get("best_candidate_id")) for item in details if item.get("best_candidate_id")), ""),
+        "final_blocker_type": next((str(item.get("final_blocker_type")) for item in details if item.get("final_blocker_type") != "none"), "none"),
         "detection_results": details,
     }
     if status == "needs_manual":
@@ -2639,12 +3565,22 @@ body{margin:0;background:#f5f7fb;color:#222;font-family:-apple-system,BlinkMacSy
             meta_parts.append(f"visible {row.get('residual_score')}")
         if "template_residual_score" in row:
             meta_parts.append(f"template {row.get('template_residual_score')}")
+        if row.get("alpha_alignment_score"):
+            meta_parts.append(f"alpha_align {row.get('alpha_alignment_score')}")
+        if row.get("alpha_template_residual_before") is not None and row.get("alpha_template_residual_after") is not None:
+            meta_parts.append(
+                f"alpha {row.get('alpha_template_residual_before')}->{row.get('alpha_template_residual_after')}"
+            )
         if row.get("post_clean_ocr_score") is not None:
             meta_parts.append(f"postOCR {row.get('post_clean_ocr_score')}")
+        if row.get("post_text_components") is not None:
+            meta_parts.append(f"components {row.get('post_text_components')}")
         if row.get("presence_reason"):
             meta_parts.append(str(row.get("presence_reason")))
         if row.get("detection", {}).get("roi_class"):
             meta_parts.append(f"roi {row['detection']['roi_class']}")
+        if row.get("reason"):
+            meta_parts.append(str(row.get("reason")))
         meta = html.escape(" | ".join(part for part in meta_parts if part))
         result_label = "Cleaned" if row.get("status") == "cleaned" else "Attempt (failed QA)"
         body.append(f"""
@@ -2733,11 +3669,17 @@ def make_compare_pdf(out_dir: Path, rows: list[dict]) -> Path:
             ("post_clean_ocr_score", "postOCR"),
             ("post_text_components", "components"),
             ("presence_score", "presence"),
+            ("alpha_alignment_score", "alpha_align"),
+            ("alpha_template_residual_after", "alpha_after"),
         ]:
             if key in row:
                 metrics.append(f"{label} {row.get(key)}")
+        if row.get("alpha_template_residual_before") is not None and row.get("alpha_template_residual_after") is not None:
+            metrics.append(f"alpha {row.get('alpha_template_residual_before')}->{row.get('alpha_template_residual_after')}")
         if row.get("detection", {}).get("roi_class"):
             metrics.append(f"roi {row['detection']['roi_class']}")
+        if row.get("reason"):
+            metrics.append(f"reason {row.get('reason')}")
         draw.text((margin, 24), f"#{idx} {filename}", fill="#111827", font=title_font)
         draw.text(
             (margin, 60),

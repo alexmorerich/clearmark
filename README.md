@@ -1,452 +1,314 @@
 # ClearMark
 
-ClearMark is a local, evidence-first pipeline for detecting, removing, and
-reviewing the `sunsky-online.com` watermark from authorized product-image
-copies. It is built for the B2B asset library at:
+ClearMark is a local, evidence-first pipeline for detecting, removing, and reviewing the visible `sunsky-online.com` watermark from authorized product-image copies.
 
-```bash
-/Users/alexkou/Documents/github/b2bweb/content/products/assets
-```
-
-The source asset directory is read-only input. ClearMark writes cleaned copies,
-failed attempts, masks, manifests, HTML reports, PDFs, and Telegram attachments
-to a separate output directory such as `/Users/alexkou/Downloads/...`.
-
-The core rule is simple:
+The project is built around one rule:
 
 ```text
-confirm the watermark position -> clean only that footprint -> publish only if post-clean evidence is clean
+confirm the Sunsky watermark position
+-> clean only the confirmed watermark footprint
+-> publish only if independent post-clean evidence is clean
 ```
 
-If any required evidence is weak, the image is marked `needs_manual`. A failed
-best attempt may be written to `attempts/` for visual review, but it is not a
-publishable cleaned image.
+Source assets are read-only input. ClearMark writes cleaned copies, failed attempts, masks, manifests, HTML review pages, PDFs, and optional Telegram review attachments to a separate output directory.
 
-## Current Design
-
-ClearMark is intentionally conservative. It optimizes for not shipping bad
-cleaned images:
-
-- Do not include images without confirmed Sunsky watermark text.
-- Do not use broad masks when the mark overlaps product detail.
-- Do not trust a repair method just because it ran successfully.
-- Do not place failed attempts in `cleaned/`.
-- Do not modify or overwrite source images.
-
-The pipeline has three major responsibilities:
-
-1. Locate the actual watermark text position.
-2. Repair the watermark footprint with the safest available strategy.
-3. Review the cleaned result with independent post-clean quality gates.
-
-## Processing Workflow
+## Project Structure
 
 ```text
-image inventory
-  -> skip known-clean iPhone 14+ files
-  -> sample master images, avoiding duplicates
-  -> detect Sunsky watermark candidates
-  -> localize the true text footprint
-  -> confirm watermark presence
-  -> classify the watermark region
-  -> build a narrow mask
-  -> generate repair candidates
-  -> optionally clean residual glyph fragments
-  -> run final publish gate
-  -> write cleaned/ or attempts/
-  -> generate review.html, compare.pdf, manifest.jsonl, summary.json
+scripts/
+  watermark_pipeline.py       main inventory, pilot, process, QA, and review workflow
+  sunsky_alpha_engine.py      deterministic Sunsky reverse-alpha repair engine
+  build_sunsky_alpha.py       reproducible alpha asset bootstrap/calibration utility
+templates/
+  watermark-template.png      canonical Sunsky text template
+  sunsky-alpha.png            generated alpha map used by reverse-alpha repair
+  sunsky-alpha-meta.json      alpha asset metadata and provenance
+tests/
+  test_sunsky_alpha_engine.py synthetic recovery and safety tests
 ```
 
-## Watermark Position Detection
-
-Watermark position accuracy is the most important part of the project. If the
-mask is wrong, every cleaning method becomes dangerous. ClearMark therefore
-separates detection into proposal, confirmation, and localization.
-
-### 1. Candidate Proposal
-
-`detect_watermark()` builds initial candidates from several sources:
-
-- Full-image EasyOCR detections when OCR is enabled.
-- Canonical `sunsky-online.com` template matching.
-- Low-contrast text-band priors for faint grey marks.
-- Bright-background recall for watermark text on white product photos.
-
-The low-contrast priors are recall helpers only. They are allowed to suggest
-where a watermark might be, but they should not be the final authority when OCR
-can read the domain text.
-
-### 2. Domain-Specific OCR Scoring
-
-OCR text is scored by `watermark_text_score()`. The matcher is deliberately
-specific to the Sunsky domain shape:
+## Execution Flow
 
 ```text
-sunsky/sky-like token + online/.com-like token
+inventory images
+-> skip known-clean iPhone 14+ assets
+-> sample master files and avoid duplicates
+-> detect possible Sunsky watermark locations
+-> confirm Sunsky presence with OCR/template evidence
+-> classify the region under the mark
+-> generate repair candidates
+   -> Sunsky reverse-alpha candidates
+   -> thin alpha-edge cleanup
+   -> near-white/background fill
+   -> Telea / Navier-Stokes inpaint
+   -> optional LaMa escalation
+   -> residual-only cleanup
+-> run the unchanged final publish gate
+-> write cleaned/ only for gate-passed outputs
+-> write attempts/ for failed best attempts
+-> write review.html, compare.pdf, manifest.jsonl, summary.json
 ```
 
-This accepts OCR variants commonly produced by faint watermarks:
+## Identifying The Watermark Position
+
+ClearMark treats position detection as a three-step evidence problem: propose, confirm, then localize.
+
+### Candidate Proposal
+
+`watermark_pipeline.py` proposes mark locations from:
+
+- EasyOCR full-image detections, when OCR is enabled.
+- OCR crop re-detection around likely template/prior hits.
+- Canonical template matching from `templates/watermark-template.png`.
+- Low-contrast text-band priors for faint watermark recall.
+- Bright-background recall for pale gray marks on near-white product photos.
+
+Priors are recall helpers only. They do not become publishable evidence by themselves when OCR or template evidence disagrees.
+
+### Sunsky Text Confirmation
+
+OCR text is scored by domain shape, not generic text likeness. The matcher looks for a Sunsky/sky-like token plus an online/.com-like token, while rejecting ordinary product labels and instructions.
+
+Confirmed examples include OCR variants such as:
 
 ```text
 sunsky-online.com
 sunsky-onlinecom
-S unsky-online.co
 sky-online.com
-~sunsky-oniine com
-Junsky-online com
+sunsky-oniine com
 ```
 
-It rejects generic product or instruction text such as:
+Rejected examples include product text such as:
 
 ```text
-More product details
-Stable Bracket
-Flex Cable
-12mini
 LCD Digitizer
+Flex Cable
+Stable Bracket
+12mini
 ```
 
-### 3. OCR Crop Localization
+### OCR Crop Localization
 
-Some images have the real watermark above a dark cable or product surface. The
-old failure mode was:
+When a broad detector finds the neighborhood, ClearMark crops around it and runs OCR again. The final repair box follows the text that OCR actually read, not a nearby high-contrast product edge.
 
-```text
-OCR confirms "sunsky-online.com" in the crop,
-but the mask lands on dark product printing below the text.
-```
+This is important for images where the watermark crosses:
 
-ClearMark fixes that by running `ocr_crop_watermark_detections()` after initial
-candidate proposal. It takes a beam of likely neighborhoods, crops around each
-one, runs OCR again, and turns the actual OCR text box into a high-priority
-`ocr:crop:*` detection.
+- dark flex cables;
+- product labels;
+- screws and connectors;
+- screen assemblies;
+- red, teal, blue, gray, or black product surfaces.
 
-This means the final repair target follows the text that OCR actually read, not
-the high-contrast product detail that happened to score well.
+### Box Normalization
 
-### 4. OCR Box Normalization
+OCR can merge the watermark with nearby text, for example `sunsky-online 12mini`. ClearMark normalizes OCR boxes by:
 
-EasyOCR sometimes merges the watermark with nearby product labels, for example:
+- clamping the box toward the canonical Sunsky aspect ratio;
+- anchoring left when trailing model tokens are present;
+- keeping enough height for anti-aliased watermark halo;
+- preventing expansion into unrelated product labels unless residual evidence later proves it is necessary.
 
-```text
-sunsky-online 12mini
-```
+### Region Classification
 
-`ocr_mark_box_from_points()` normalizes OCR boxes before they become repair
-targets:
+After localization, ClearMark classifies the pixels under the mark. The ROI class controls mask size and repair strategy.
 
-- It keeps the box centered on the domain text line.
-- It clamps very wide OCR lines toward the canonical Sunsky aspect ratio.
-- It anchors left when trailing model tokens are detected.
-- It allows a slightly larger detection box for OCR localization while keeping
-the final repair mask area guarded.
-
-This prevents the mask from covering nearby labels such as `12mini` unless the
-watermark genuinely overlaps them.
-
-### 5. Candidate Ranking And NMS
-
-Detections are ranked with `detection_rank()`:
-
-- Direct OCR and OCR-crop detections rank highest.
-- Template detections rank next.
-- Prior text-band detections rank lowest, especially on dark product surfaces,
-  thin flex cables, complex detail, or text/label areas.
-
-Non-maximum suppression keeps only distinct candidates. This avoids cleaning
-several overlapping versions of the same mark.
-
-### 6. Presence Confirmation
-
-`confirm_watermark_presence()` decides whether an image belongs in a
-watermarked-only pilot:
-
-- Direct OCR confirmation passes.
-- OCR crop confirmation passes.
-- Without OCR, only strong canonical-template evidence passes.
-- Text-dense layouts require direct evidence.
-
-If presence is not confirmed, the image is recorded as `no_watermark` and is not
-included in a watermarked-only 50-image review.
-
-## Region Classification
-
-After the mark box is selected, `estimate_product_overlap_v13()` classifies what
-is under the watermark. The classifier uses interior pixels, not detector type.
-
-It measures:
-
-- mean and standard deviation of luma;
-- dark, non-white, and white pixel ratios;
-- Canny edge density;
-- local text-like components;
-- horizontal line dominance;
-- contrast span.
-
-Current ROI classes:
-
-| Class | Meaning |
+| ROI class | Meaning |
 | --- | --- |
 | `plain_white` | mostly white, very low edge density |
-| `near_white` | bright, low-detail background |
-| `low_texture_background` | smooth background or product plane |
+| `near_white` | bright and low-detail |
+| `low_texture_background` | smooth background or smooth product plane |
 | `simple_product_surface` | product surface with moderate structure |
 | `dark_product_surface` | black or dark product region |
-| `thin_flex_cable` | thin dark cable or line-dominant structure |
-| `complex_product_detail` | high edge/contrast product detail |
-| `text_or_label_area` | real product text or label nearby |
+| `thin_flex_cable` | line-dominant cable or connector structure |
+| `complex_product_detail` | dense edges, screws, assemblies, or contours |
+| `text_or_label_area` | real product text or label near the watermark |
 | `unknown` | no confident class |
 
-High-risk classes force conservative mask and repair choices.
-
-## Mask Strategy
-
-ClearMark uses narrow masks first. The goal is to cover the watermark glyphs,
-not a large rectangle around them.
-
-### Canonical Glyph Mask
-
-For OCR, OCR-crop, prior, and canonical template detections, `create_mask()` now
-uses the canonical Sunsky ink shape from:
-
-```text
-templates/watermark-template.png
-```
-
-The canonical ink is scaled into the localized mark box and then lightly
-dilated. This avoids the earlier failure where local contrast inside a dark
-product region selected product printing or cable edges instead of the faint
-watermark.
-
-### Mask Variants
-
-The cleaning loop tries several mask variants:
-
-- `glyph_tight`
-- `glyph_medium`
-- `glyph_strong`
-- tight and medium box masks only on safer low-risk regions
-- high-contrast box masks only when the ROI is not product-risky
-
-Risky ROI classes use glyph-only variants:
-
-```text
-dark_product_surface
-thin_flex_cable
-complex_product_detail
-text_or_label_area
-text-dense layouts
-```
-
-### Mask Area Guards
-
-Mask size is limited by:
-
-- `MAX_MASK_AREA`
-- `OCR_DETECTION_MAX_AREA`
-- `PILOT_MASK_AREA`
-- combined multi-detection mask area checks
-
-The OCR detection box may be larger than a normal candidate box because it is a
-positioning aid. The actual repair mask still has to pass the stricter mask
-area gates.
+High-risk classes use narrower masks, thinner cleanup, and stricter product-damage review.
 
 ## Cleaning Strategies
 
-ClearMark currently uses a compact strategy bank. It does not try to hide bad
-repairs by calling them clean.
+ClearMark generates candidates, then lets the final gate decide. No cleaning method can publish on its own.
 
-### 1. Near-Area Background Fill
+### Sunsky Reverse-Alpha Engine
 
-`near_area_background_fill_repair()` is the first choice for pure white,
-near-white, and low-texture background pixels.
+The primary repair path is `SunskyAlphaEngine` in `scripts/sunsky_alpha_engine.py`.
 
-Instead of asking inpainting to hallucinate a plain background, it:
-
-1. Builds a context window around the mark.
-2. Excludes the watermark mask from that window.
-3. Samples the nearby clean background ring.
-4. Estimates local color and tiny texture/noise.
-5. Feather-blends that background into only the background part of the mask.
-
-On product-overlap pixels, it uses a much smaller inpaint pass and refuses broad
-white fills. This directly addresses the common case where the right answer is
-to imitate the nearby clean background, not smear the product.
-
-### 2. OpenCV Telea Inpaint
-
-Telea is tried with the current mask variant. It works best on smooth
-backgrounds and small glyph masks. It is not automatically trusted; it must pass
-the final QA gate.
-
-### 3. OpenCV Navier-Stokes Inpaint
-
-Navier-Stokes is tried as another classical candidate. It can behave better on
-some gradients and edges, but it is judged by the same QA metrics.
-
-### 4. Optional LaMa / IOPaint Escalation
-
-If enabled and available, LaMa/IOPaint can be attempted for high-residual
-cases. Review pilots normally use `--no-lama` for speed. Production-quality
-experiments can enable it when runtime is less important.
-
-### 5. Residual Component Cleanup
-
-If the first selected repair still has broken glyphs or dot-chain residue,
-ClearMark may attempt a second small cleanup:
-
-- `cleanup_residual_components_with_ring_fill()`
-- `cleanup_residual_components_with_inpaint()`
-
-These methods operate on detected residual components, not on the full
-watermark rectangle. They are only attempted when the blocker is residual text
-and not product damage or a visible band.
-
-## Cleaning Quality Review
-
-ClearMark treats review as a publish decision, not a diagnostic afterthought.
-The final output must pass independent checks after cleaning.
-
-### Final Publish Gate
-
-`final_publish_gate()` returns `cleaned` only if all required checks pass:
-
-| Check | Criterion |
-| --- | --- |
-| Metrics valid | Required QA metrics exist and are numeric |
-| Residual score | `residual_score <= FINAL_RESIDUAL_MAX` |
-| Template residual | `template_residual_score <= FINAL_TEMPLATE_MAX` |
-| Text components | `post_text_components <= FINAL_TEXT_COMPONENTS_MAX` |
-| Re-detection | post-clean detector count is zero |
-| OCR double-check | cleaned mark-box crop does not still read Sunsky |
-| Dot-chain gate | broken glyph fragments do not form a readable row |
-| Band gate | repair does not create a visible rectangular band |
-| Product gate | product detail is not damaged beyond thresholds |
-
-If any check fails, status is `needs_manual`.
-
-### Residual Criteria
-
-Residual text is measured inside the known watermark footprint:
-
-- `residual_score` combines template residue, text-likeness, and component
-  count.
-- `template_residual_score` reruns canonical template matching after cleaning.
-- `post_text_components` counts text-like connected components remaining in the
-  mark box.
-- `post_clean_detection_count` detects whether a new watermark candidate still
-  exists after repair.
-
-### OCR Double-Check
-
-`cleaned_crop_ocr_check()` crops around the cleaned mark box and reruns OCR.
-
-The gate fails if OCR sees a domain-like Sunsky string above the suspect
-threshold, even if OCR confidence is low. This catches cases where a repair
-visually smears the word but still leaves readable fragments like:
+The engine models the watermark as a semi-transparent fixed text overlay:
 
 ```text
-sunsky-online.co
-sky-online.com
-sunsky-onlin
+watermarked = alpha * logo_color + (1 - alpha) * clean_image
 ```
 
-### Dot-Chain / Broken-Glyph Gate
-
-`residual_component_metrics()` searches a horizontally expanded mark footprint
-for small aligned residual components. It fails when the fragments form a row
-that a human can still read as watermark text.
-
-### Visible Band Gate
-
-`detect_rectangular_band_visibility()` compares original and candidate pixels
-around the changed region. It rejects obvious rectangular bands or hard luma
-boundaries caused by a repair.
-
-### Product Damage Gate
-
-`detect_product_damage_v13()` evaluates product-overlap changes:
-
-- color delta;
-- edge retention;
-- bright or dark blob score;
-- changed area ratio.
-
-Dark product surfaces and thin flex cables have stricter handling because white
-or pale fills are especially visible there.
-
-### Review Outputs
-
-Each review run writes:
+It reverses that blend only where the alpha map is present:
 
 ```text
-originals/        source copies for review
-overlays/         original plus red mask overlay
-cleaned/          publish-gate-passed outputs only
-attempts/         failed best attempts for inspection
-masks/            binary masks
-diffs/            amplified visual diff
-manifest.jsonl    per-image metadata
-summary.json      run summary
-review.html       browser review
-compare.pdf       PDF review and Telegram attachment
+restored = (watermarked - alpha * logo_color) / clamp(1 - alpha, 0.25, 1.0)
 ```
 
-The HTML/PDF columns are:
+Pixels outside the alpha footprint are not modified.
+
+The engine uses:
+
+- `templates/sunsky-alpha.png` as the registered Sunsky alpha asset;
+- shape-consistent NCC alignment inside the confirmed mark box;
+- a small search over scale, x/y offset, alpha gain, and logo luma;
+- polarity-aware glyph extraction for bright-on-dark and dark-on-light watermarks;
+- candidate self-arbitration by residual evidence;
+- safe no-op behavior when the alpha asset or alignment evidence is missing.
+
+Candidate strategy names include:
 
 ```text
-Original | Mask overlay | Result | Diff x3
+sunsky_reverse_alpha_aligned
+sunsky_reverse_alpha_aligned_thin_ns
 ```
 
-For `needs_manual`, the result column is labeled `Attempt (failed QA)`. Those
-files are review artifacts only.
+### Thin Alpha-Edge Cleanup
 
-## Status Semantics
+Reverse-alpha removes the blended watermark first. A tiny Navier-Stokes pass can then run over the alpha edge footprint only.
 
-| Status | Publishable | Meaning |
-| --- | --- | --- |
-| `cleaned` | yes | Final publish gate passed; file is written to `cleaned/` |
-| `needs_manual` | no | Detection exists, but cleaning failed QA; best attempt may be in `attempts/` |
-| `no_watermark` | no action | No confirmed Sunsky watermark |
-| `skipped` | no action | Known-clean iPhone 14+ image |
-| `cleaned_duplicate` | yes | Duplicate reused a cleaned master result |
-| `duplicate_no_action` | no action | Duplicate skipped because the master was not cleaned |
+Rules:
+
+- radius is 1 for risky product regions;
+- radius is 2 for safer low-texture regions;
+- cleanup never uses a full mark-box rectangle;
+- product detail, cables, and labels still have to pass product-damage QA.
+
+### Near-White Row Fill
+
+For `plain_white`, `near_white`, and `low_texture_background`, ClearMark can use a row-local background fill. It estimates nearby luma/chroma from a clean context ring and fills only the watermark mask with small matched noise.
+
+This avoids gray halos and avoids broad white rectangles.
+
+### Dark Surface Scrub
+
+For `dark_product_surface`, ClearMark avoids pale fills. It samples nearby dark pixels, scrubs only low-alpha watermark residue, and preserves strong product edges.
+
+Manifest evidence includes `dark_surface_scrub_used` when this path is selected.
+
+### Thin Flex Cable Protected Cleanup
+
+For `thin_flex_cable`, ClearMark builds a product-edge protection mask from dark connected components and strong edges. Cleanup is allowed only on low-contrast residual watermark pixels.
+
+Review metrics include:
+
+```json
+{
+  "protected_edge_loss": 0.0,
+  "cable_silhouette_delta": 0.0
+}
+```
+
+### Solid Color Surface Fill
+
+For smooth colored surfaces such as red LCD backing, blue adhesive film, teal pads, or gray metal plates, ClearMark fits a local color plane and fills only the residual alpha/glyph footprint.
+
+The visible-band gate remains strict.
+
+### Repeated Object Clone
+
+When a repeated object is confidently available nearby, ClearMark may clone from a similar neighboring component and feather only inside the residual watermark mask.
+
+This is optional and requires high similarity. Shape mismatch is rejected by the final gate.
+
+### Generic Inpaint And Optional LaMa
+
+Telea, Navier-Stokes, and optional LaMa remain fallback candidates. They are not allowed to bypass OCR, dot-chain, product-damage, visible-band, or alpha-template residual checks.
+
+## Quality Review Methods And Criteria
+
+ClearMark keeps the final publish gate strict. The patch adds better candidates; it does not loosen approval thresholds to force more `cleaned/` outputs.
+
+### Final Gate Evidence
+
+A cleaned candidate must pass:
+
+- residual visibility score;
+- canonical template residual score;
+- alpha-template residual score;
+- post-clean OCR Sunsky check;
+- post-clean detector count;
+- dot-chain residual detection;
+- visible rectangular band detection;
+- product-damage detection;
+- required metric validity checks.
+
+If any required signal fails, the image is marked `needs_manual`.
+
+### Residual Watermark Criteria
+
+The result must not contain readable or template-matching Sunsky remnants.
+
+Tracked fields include:
+
+```json
+{
+  "residual_score": 0.0,
+  "template_residual_score": 0.0,
+  "alpha_template_residual_before": 0.0,
+  "alpha_template_residual_after": 0.0,
+  "alpha_residual_reduction": 0.0,
+  "post_clean_ocr_score": 0.0,
+  "post_text_components": 0,
+  "dot_chain_score": 0.0
+}
+```
+
+### Band Visibility Criteria
+
+The repair must not create a visible rectangle, halo, smear, or row/box patch. The gate checks local luma delta and edge-box structure around the changed mask.
+
+### Product Damage Criteria
+
+The repair must not damage product contours, labels, dark surfaces, cables, or connector details. Product QA checks:
+
+- color delta on product pixels;
+- product edge retention;
+- bright/dark blob formation;
+- changed area ratio inside protected regions.
+
+### Manifest And Review Fields
+
+Each processed image records diagnostic fields such as:
+
+```json
+{
+  "alpha_engine_used": true,
+  "alpha_asset": "templates/sunsky-alpha.png",
+  "alpha_asset_version": "bootstrap_from_canonical_template",
+  "alpha_alignment_score": 0.0,
+  "alpha_candidate_count": 0,
+  "alpha_best_gain": 1.0,
+  "alpha_best_logo_bgr": [180, 180, 180],
+  "thin_residual_inpaint": true,
+  "candidate_count": 0,
+  "best_candidate_id": "",
+  "final_blocker_type": "residual_watermark"
+}
+```
+
+Review HTML and PDF header lines include strategy, ROI class, alpha alignment, alpha before/after residual, OCR score, template score, component count, and rejection reason.
 
 ## Commands
 
-### Install
+Build or refresh the bootstrap alpha asset:
 
 ```bash
-cd /Users/alexkou/Documents/openai/clearmark
-python3 -m pip install -r requirements.txt
+python3 scripts/build_sunsky_alpha.py
 ```
 
-Optional OCR requires EasyOCR. Optional neural inpainting requires
-`simple_lama_inpainting` or a local `iopaint` command.
-
-### 50-Image Review Pilot
+Run checks:
 
 ```bash
-cd /Users/alexkou/Documents/openai/clearmark
-python3 scripts/watermark_pipeline.py pilot \
-  --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
-  --max-total 50 \
-  --max-scan 700 \
-  --watermarked-only \
-  --preset review \
-  --no-lama \
-  --pdf \
-  --out /Users/alexkou/Downloads/clearmark-sunsky-50 \
-  --rights-confirmed
+python3 -m py_compile scripts/watermark_pipeline.py scripts/sunsky_alpha_engine.py scripts/build_sunsky_alpha.py
+python3 -m pytest -q
+git diff --check
 ```
 
-### Send Review PDF To Telegram
+Run a 50-image review pilot:
 
 ```bash
-set -a
-source /Users/alexkou/.claude/channels/telegram/.env
-set +a
-
 python3 scripts/watermark_pipeline.py pilot \
   --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
   --max-total 50 \
@@ -456,115 +318,17 @@ python3 scripts/watermark_pipeline.py pilot \
   --no-lama \
   --pdf \
   --telegram \
-  --telegram-chat-id 8339510717 \
-  --out /Users/alexkou/Downloads/clearmark-sunsky-50 \
+  --out /Users/alexkou/Downloads/clearmark-alpha-v1 \
   --rights-confirmed
 ```
 
-### One-Pass Processing
+## Safety Guarantees
 
-```bash
-python3 scripts/watermark_pipeline.py process \
-  --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
-  --preset review \
-  --ocr \
-  --rights-confirmed
-```
+ClearMark does not:
 
-One-pass logic:
-
-```text
-for each non-iPhone-14+ master image:
-    detect and localize the Sunsky watermark
-    if no confirmed watermark -> no_watermark
-    if confirmed watermark    -> repair and QA
-    if publish gate passes    -> cleaned/
-    otherwise                 -> attempts/ + needs_manual
-
-duplicates:
-    reuse master output only when master status is cleaned
-```
-
-## Manifest Fields
-
-Useful fields in `manifest.jsonl`:
-
-- `file`
-- `status`
-- `presence_reason`
-- `presence_score`
-- `strategy`
-- `mask_area_pct`
-- `residual_score`
-- `template_residual_score`
-- `post_text_components`
-- `post_clean_detection_count`
-- `sunsky_check_pass`
-- `post_clean_ocr_score`
-- `roi_class`
-- `product_overlap`
-- `cleanup_attempted`
-- `cleanup_strategy`
-- `reason`
-- `detection.mark_box`
-- `detection.template`
-
-These fields are the first place to look when a mask is misplaced or a cleaned
-result is rejected.
-
-## Project Structure
-
-```text
-clearmark/
-  README.md
-  requirements.txt
-  scripts/
-    watermark_pipeline.py
-  templates/
-    watermark-template.png
-  outputs/
-```
-
-`outputs/` is ignored generated output. Production source assets live outside
-this repo and are never edited.
-
-## Validation Checklist
-
-Before committing code:
-
-```bash
-cd /Users/alexkou/Documents/openai/clearmark
-python3 -m py_compile scripts/watermark_pipeline.py
-git diff --check
-```
-
-Before trusting a visual-quality change:
-
-```bash
-python3 scripts/watermark_pipeline.py pilot \
-  --assets /Users/alexkou/Documents/github/b2bweb/content/products/assets \
-  --max-total 50 \
-  --max-scan 700 \
-  --watermarked-only \
-  --preset review \
-  --no-lama \
-  --pdf \
-  --out /Users/alexkou/Downloads/clearmark-review \
-  --rights-confirmed
-```
-
-Then inspect:
-
-- mask overlay position;
-- whether `cleaned/` contains only publish-gate-passed files;
-- whether `attempts/` explains failures clearly;
-- OCR residual and dot-chain metrics;
-- product-damage metrics on dark surfaces and flex cables.
-
-## Operating Rules
-
-- Never push generated cleaned images, attempts, reports, or PDFs to GitHub.
-- Never write output into `/Users/alexkou/Documents/github/b2bweb`.
-- Keep OCR enabled for official review pilots.
-- Use `--no-lama` when speed matters; enable LaMa only for quality experiments.
-- Treat `needs_manual` as a failed output, not as a cleaned image.
+- modify source images;
+- write failed repairs to `cleaned/`;
+- publish when OCR still reads Sunsky;
+- disable dot-chain, visible-band, product-damage, or alpha-template gates;
+- use broad rectangle fills over product-overlap regions;
+- strip metadata, remove invisible watermarks, regenerate images, or perform general AI-label removal.
