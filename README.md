@@ -152,9 +152,12 @@ Pixels outside the alpha footprint are not modified.
 The engine uses:
 
 - `templates/sunsky-alpha.png` as the registered Sunsky alpha asset;
+- calibrated sample-crop alpha metadata from `templates/sunsky-alpha-meta.json`;
 - shape-consistent NCC alignment inside the confirmed mark box;
 - a small search over scale, x/y offset, alpha gain, and logo luma;
+- per-image background alpha solving inside the aligned glyph support;
 - polarity-aware glyph extraction for bright-on-dark and dark-on-light watermarks;
+- a reserved gate-evaluation budget for alpha candidates so they are not crowded out by glyph/inpaint variants;
 - candidate self-arbitration by residual evidence;
 - safe no-op behavior when the alpha asset or alignment evidence is missing.
 
@@ -163,7 +166,12 @@ Candidate strategy names include:
 ```text
 sunsky_reverse_alpha_aligned
 sunsky_reverse_alpha_aligned_thin_ns
+sunsky_reverse_alpha_solved
+sunsky_reverse_alpha_solved_thin_ns
+sunsky_reverse_alpha_solved_bg_fill
 ```
+
+`sunsky_reverse_alpha_solved` treats the stored alpha image as support, then solves the actual opacity from the current image and a local background estimate. On safe low-variance regions, `sunsky_reverse_alpha_solved_bg_fill` can replace only the solved glyph support with ring/background color. That candidate still goes through the same visible-band, product-damage, OCR, detector, dot-chain, and alpha residual gates.
 
 ### Thin Alpha-Edge Cleanup
 
@@ -277,9 +285,12 @@ Each processed image records diagnostic fields such as:
 {
   "alpha_engine_used": true,
   "alpha_asset": "templates/sunsky-alpha.png",
-  "alpha_asset_version": "bootstrap_from_canonical_template",
+  "alpha_asset_version": "sample_crop_background_alpha_solve",
   "alpha_alignment_score": 0.0,
   "alpha_candidate_count": 0,
+  "alpha_candidates_generated": 0,
+  "alpha_candidates_evaluated": 0,
+  "best_alpha_after_over_all_candidates": 0.0,
   "alpha_best_gain": 1.0,
   "alpha_best_logo_bgr": [180, 180, 180],
   "thin_residual_inpaint": true,
@@ -289,15 +300,17 @@ Each processed image records diagnostic fields such as:
 }
 ```
 
-Review HTML and PDF header lines include strategy, ROI class, alpha alignment, alpha before/after residual, OCR score, template score, component count, and rejection reason.
+Review HTML and PDF header lines include strategy, ROI class, alpha alignment, alpha before/after residual, OCR score, template score, component count, and rejection reason. `summary.json` also records `reject_reason_histogram`, `alpha_candidates_generated_total`, and `alpha_candidates_evaluated_total` so a review run shows whether the dominant blocker is residual watermark, alpha residual, visible banding, product damage, or missing evidence.
 
 ## Commands
 
-Build or refresh the bootstrap alpha asset:
+Build or refresh the calibrated alpha asset:
 
 ```bash
-python3 scripts/build_sunsky_alpha.py
+python3 scripts/build_sunsky_alpha.py --samples templates/
 ```
+
+Without `--samples`, the script falls back to a bootstrap alpha from `templates/watermark-template.png`. With sample crops, `sunsky-alpha-meta.json` records the calibration method, sample directory, sample file names, and `samples_used`.
 
 Run checks:
 

@@ -115,6 +115,8 @@ TAIL_EXPAND_MAX_PX = 18
 TOP_K_CANDIDATES = 5
 MAX_SECOND_PASS_ATTEMPTS = 2
 MAX_TOTAL_REPAIR_CANDIDATES = 24
+MAX_ALPHA_REPAIR_CANDIDATES = 24
+ALPHA_EVAL_RESERVED_CANDIDATES = 8
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
@@ -2955,9 +2957,18 @@ def clean_image(
     first_mask = None
     first_area = 0.0
     alpha_candidate_count = 0
+    alpha_candidates_generated = 0
     alpha_asset_used = False
 
     engine = sunsky_alpha_engine()
+    mark_tuple = mark_box_tuple(det)
+    alpha_template = engine.alpha if engine is not None and engine.alpha_available() else None
+
+    def alpha_probe_score(candidate_bgr: np.ndarray) -> float:
+        if alpha_template is None:
+            return 0.0
+        return float(score_alpha_residual(candidate_bgr, mark_tuple, alpha_template))
+
     alpha_allowed = (
         engine is not None
         and engine.alpha_available()
@@ -2967,12 +2978,12 @@ def clean_image(
     )
     if alpha_allowed and engine is not None:
         alpha_asset_used = True
-        for idx, alpha_candidate in enumerate(
-            engine.reverse_alpha_candidates(img, mark_box_tuple(det), roi_class=det.roi_class)
-        ):
+        raw_alpha_candidates = engine.reverse_alpha_candidates(img, mark_tuple, roi_class=det.roi_class)
+        alpha_candidates_generated = len(raw_alpha_candidates)
+        for idx, alpha_candidate in enumerate(raw_alpha_candidates):
             alpha_mask = (alpha_candidate.alpha_map >= ALPHA_FLOOR).astype(np.uint8) * 255
             alpha_area = float(np.count_nonzero(alpha_mask)) / max(1, alpha_mask.size)
-            area_limit = RESIDUAL_CLEANUP_RISKY_AREA_MAX if risky_product_roi else PILOT_MASK_AREA
+            area_limit = RESIDUAL_CLEANUP_RISKY_AREA_MAX if risky_product_roi else MAX_MASK_AREA
             if alpha_area <= 0.0 or alpha_area > area_limit:
                 continue
             cgray = cv2.cvtColor(alpha_candidate.image, cv2.COLOR_BGR2GRAY)
@@ -2981,15 +2992,16 @@ def clean_image(
             residual = metrics["residual_score"]
             template_residual = metrics["template_residual_score"]
             cost = (
-                min(1.0, residual) * 3.0
-                + min(1.0, template_residual) * 3.0
-                + float(alpha_candidate.residual_probe_score) * 2.0
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.35
+                + float(alpha_candidate.residual_probe_score) * 1.25
                 + metrics["post_text_components"] * 0.20
-                + alpha_area * 5.0
-                - min(0.35, float(alpha_candidate.alignment_score) * 0.20)
+                + alpha_area * 6.0
+                - min(0.35, float(alpha_candidate.alignment_score) * 0.24)
             )
             extra = {
                 "alpha_engine_used": True,
+                "alpha_candidate": True,
                 "alpha_candidate_index": idx,
                 "alpha_alignment_score": float(alpha_candidate.alignment_score),
                 "alpha_best_gain": float(alpha_candidate.alpha_gain),
@@ -3016,7 +3028,7 @@ def clean_image(
                 extra,
             ))
             alpha_candidate_count += 1
-            if alpha_candidate_count >= 12:
+            if alpha_candidate_count >= MAX_ALPHA_REPAIR_CANDIDATES:
                 break
 
     for variant, pad_x, pad_y, dilate_px, radius, glyph in variants:
@@ -3042,9 +3054,11 @@ def clean_image(
             metrics = residual_quality_metrics(cgray, det, templates)
             residual = metrics["residual_score"]
             template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(near_candidate)
             cost = (
                 min(1.0, residual)
-                + min(1.0, template_residual) * 0.18
+                + min(1.0, template_residual) * 0.25
+                + alpha_probe * 1.00
                 + near_area * 6.0
                 + max(0.0, 0.12 - sharpness_ratio) * 0.30
                 - min(0.18, bg_fraction * 0.10)
@@ -3059,7 +3073,7 @@ def clean_image(
                 near_candidate,
                 near_mask,
                 metrics,
-                {},
+                {"alpha_residual_probe_score": alpha_probe},
             ))
         for method_name, method in (("telea", cv2.INPAINT_TELEA), ("ns", cv2.INPAINT_NS)):
             candidate = cv2.inpaint(img, mask, radius, method)
@@ -3068,11 +3082,13 @@ def clean_image(
             metrics = residual_quality_metrics(cgray, det, templates)
             residual = metrics["residual_score"]
             template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(candidate)
             artifact_penalty = max(0.0, 0.18 - sharpness_ratio) * 0.55
             box_penalty = area * 2.0 if high_contrast_mask and not glyph else 0.0
             cost = (
                 min(1.0, residual)
-                + min(1.0, template_residual) * 0.18
+                + min(1.0, template_residual) * 0.25
+                + alpha_probe * 1.00
                 + area * 10.0
                 + artifact_penalty
                 + box_penalty
@@ -3088,7 +3104,7 @@ def clean_image(
                 candidate,
                 mask,
                 metrics,
-                {},
+                {"alpha_residual_probe_score": alpha_probe},
             ))
 
     if not candidates:
@@ -3103,8 +3119,36 @@ def clean_image(
     selected_eval: dict | None = None
     candidate_traces = []
     selected_candidate_id = "cand_00"
-    for cand in candidates[:MAX_TOTAL_REPAIR_CANDIDATES]:
+    evaluation_candidates = []
+    seen_candidate_keys = set()
+
+    def add_eval_candidate(candidate_tuple) -> None:
+        key = (id(candidate_tuple[6]), candidate_tuple[5])
+        if key in seen_candidate_keys:
+            return
+        seen_candidate_keys.add(key)
+        evaluation_candidates.append(candidate_tuple)
+
+    for cand in candidates[:4]:
+        add_eval_candidate(cand)
+    for cand in [item for item in candidates if item[9].get("alpha_candidate") and "solved" in item[5]][:ALPHA_EVAL_RESERVED_CANDIDATES]:
+        add_eval_candidate(cand)
+    for cand in [item for item in candidates if item[9].get("alpha_candidate")][:ALPHA_EVAL_RESERVED_CANDIDATES]:
+        add_eval_candidate(cand)
+    for cand in candidates:
+        if len(evaluation_candidates) >= MAX_TOTAL_REPAIR_CANDIDATES:
+            break
+        add_eval_candidate(cand)
+
+    alpha_candidates_evaluated = 0
+    best_alpha_after = min(
+        [float(item[9].get("alpha_residual_probe_score")) for item in candidates if item[9].get("alpha_candidate")],
+        default=0.0,
+    )
+    for cand in evaluation_candidates:
         _, cresidual, ctemplate_residual, cratio, carea, cname, cbest, cmask, cmetrics, cextra = cand
+        if cextra.get("alpha_candidate"):
+            alpha_candidates_evaluated += 1
         (
             cgray,
             cmetrics,
@@ -3344,6 +3388,9 @@ def clean_image(
         "cleanup_strategy": cleanup_strategy,
         "cleanup_mask_area_pct": round(cleanup_mask_area * 100, 3),
         "candidate_count": len(candidates),
+        "alpha_candidates_generated": alpha_candidates_generated,
+        "alpha_candidates_evaluated": alpha_candidates_evaluated,
+        "best_alpha_after_over_all_candidates": round(float(best_alpha_after), 4),
         "best_candidate_id": selected_candidate_id,
         "candidate_gate_trace": candidate_traces[:TOP_K_CANDIDATES],
         "final_blocker_type": final_blocker_type(gate_meta),
@@ -3461,6 +3508,21 @@ def clean_all_detections(
         for item in details
         if isinstance(item.get("alpha_candidate_count"), int)
     ]
+    alpha_candidates_generated_counts = [
+        int(item["alpha_candidates_generated"])
+        for item in details
+        if isinstance(item.get("alpha_candidates_generated"), int)
+    ]
+    alpha_candidates_evaluated_counts = [
+        int(item["alpha_candidates_evaluated"])
+        for item in details
+        if isinstance(item.get("alpha_candidates_evaluated"), int)
+    ]
+    best_alpha_after_candidates = [
+        float(item["best_alpha_after_over_all_candidates"])
+        for item in details
+        if isinstance(item.get("best_alpha_after_over_all_candidates"), (int, float))
+    ]
     repair_candidate_counts = [
         int(item["candidate_count"])
         for item in details
@@ -3503,6 +3565,11 @@ def clean_all_detections(
         "alpha_asset_version": str(sunsky_alpha_meta().get("method") or ""),
         "alpha_alignment_score": round(max(alpha_alignment_scores), 4) if alpha_alignment_scores else 0.0,
         "alpha_candidate_count": sum(alpha_candidate_counts) if alpha_candidate_counts else 0,
+        "alpha_candidates_generated": sum(alpha_candidates_generated_counts) if alpha_candidates_generated_counts else 0,
+        "alpha_candidates_evaluated": sum(alpha_candidates_evaluated_counts) if alpha_candidates_evaluated_counts else 0,
+        "best_alpha_after_over_all_candidates": (
+            round(min(best_alpha_after_candidates), 4) if best_alpha_after_candidates else 0.0
+        ),
         "alpha_best_gain": next((item.get("alpha_best_gain") for item in details if item.get("alpha_best_gain")), 0.0),
         "alpha_best_logo_bgr": next((item.get("alpha_best_logo_bgr") for item in details if item.get("alpha_best_logo_bgr")), []),
         "alpha_template_residual_before": round(max(alpha_before_scores), 4) if alpha_before_scores else 0.0,
@@ -4008,6 +4075,25 @@ def cmd_inventory(args: argparse.Namespace) -> None:
     print(f"Rows: {len(rows)}")
 
 
+def reject_reason_histogram(rows: list[dict]) -> dict:
+    histogram: dict[str, int] = {}
+    for row in rows:
+        reasons: list[str] = []
+        if isinstance(row.get("reason"), str):
+            reasons.extend(part for part in row["reason"].split(";") if part)
+        for detail in row.get("detection_results") or []:
+            if isinstance(detail.get("reason"), str):
+                reasons.extend(part for part in detail["reason"].split(";") if part)
+            gate_reasons = detail.get("reject_reasons")
+            if isinstance(gate_reasons, list):
+                reasons.extend(str(part) for part in gate_reasons if part)
+        if row.get("status") == "no_watermark" and not reasons:
+            reasons.append(str(row.get("presence_reason") or "no_watermark"))
+        for reason in dict.fromkeys(reasons):
+            histogram[reason] = histogram.get(reason, 0) + 1
+    return dict(sorted(histogram.items(), key=lambda item: (-item[1], item[0])))
+
+
 def cmd_pilot(args: argparse.Namespace) -> None:
     global ENABLE_LAMA_ESCALATION
     require_rights(args)
@@ -4049,6 +4135,16 @@ def cmd_pilot(args: argparse.Namespace) -> None:
     counts = {}
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
+    alpha_generated = [
+        int(row["alpha_candidates_generated"])
+        for row in rows
+        if isinstance(row.get("alpha_candidates_generated"), int)
+    ]
+    alpha_evaluated = [
+        int(row["alpha_candidates_evaluated"])
+        for row in rows
+        if isinstance(row.get("alpha_candidates_evaluated"), int)
+    ]
     final = {
         "mode": "pilot",
         "assets": str(assets),
@@ -4063,6 +4159,9 @@ def cmd_pilot(args: argparse.Namespace) -> None:
         "seconds": round(time.time() - started, 2),
         "inventory": summary["counts"],
         "counts": counts,
+        "reject_reason_histogram": reject_reason_histogram(rows),
+        "alpha_candidates_generated_total": sum(alpha_generated) if alpha_generated else 0,
+        "alpha_candidates_evaluated_total": sum(alpha_evaluated) if alpha_evaluated else 0,
     }
     pdf_path = None
     if args.pdf or args.telegram:

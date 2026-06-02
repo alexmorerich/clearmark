@@ -117,3 +117,51 @@ def test_unconfirmed_detection_never_enters_cleaning(monkeypatch, tmp_path: Path
     assert "review_cleaned" not in row
     assert not (tmp_path / "out" / "cleaned").exists()
     assert not (tmp_path / "out" / "attempts").exists()
+
+
+def test_alpha_candidates_are_reserved_for_gate_evaluation(monkeypatch) -> None:
+    eng = pipeline.sunsky_alpha_engine()
+    assert eng is not None and eng.alpha_available()
+    clean = np.full((180, 260, 3), 242, np.uint8)
+    alpha = np.zeros(clean.shape[:2], dtype=np.float32)
+    alpha[80:101, 52:208] = cv2.resize(eng.alpha, (156, 21), interpolation=cv2.INTER_AREA)
+    watermarked = np.uint8(
+        np.clip(alpha[:, :, None] * np.array((190.0, 190.0, 190.0), np.float32) + (1.0 - alpha[:, :, None]) * clean, 0, 255)
+    )
+    gray = cv2.cvtColor(watermarked, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=50,
+        y=70,
+        w=160,
+        h=40,
+        score=0.90,
+        verify_score=0.90,
+        template="watermark-template.png",
+        scale=1.0,
+        mark_box={"x": 50, "y": 70, "w": 160, "h": 40},
+        mask_area_pct=0.8,
+        text_score=0.90,
+        text_components=14,
+        contrast_span=20.0,
+        line_dominance=0.20,
+        confidence=0.95,
+        roi_class="near_white",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "cleaned_crop_ocr_check",
+        lambda *args, **kwargs: {"ocr_checked": True, "ocr_watermark": False, "ocr_watermark_score": 0.0},
+    )
+    monkeypatch.setattr(pipeline, "post_clean_detection_count", lambda *args, **kwargs: 0)
+
+    _, _, meta = pipeline.clean_image(watermarked, gray, det, pipeline.load_templates(), ocr_reader=object())
+
+    assert meta["alpha_candidates_generated"] > 0
+    assert meta["alpha_candidates_evaluated"] > 0
+    assert meta["best_alpha_after_over_all_candidates"] >= 0.0
+    assert any(
+        trace["alpha_alignment_score"] > 0
+        for trace in meta.get("candidate_gate_trace", [])
+        if trace["strategy"].startswith("sunsky_reverse_alpha")
+    )

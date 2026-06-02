@@ -1,20 +1,22 @@
 {
   "mark": "sunsky-online.com",
-  "method": "bootstrap_from_canonical_template",
+  "method": "sample_crop_background_alpha_solve",
   "logo_bgr": [
     180,
     180,
     180
   ],
   "alpha_floor": 0.02,
-  "samples_used": 0,
+  "samples_used": 5,
   "source_template": "/Users/alexkou/Documents/openai/clearmark/templates/watermark-template.png",
-  "crop_box": [
-    3,
-    3,
-    168,
-    23
+  "samples_dir": "templates",
+  "sample_files": [
+    "real-1.png",
+    "real-2.png",
+    "real-3.png",
+    "real-4.png",
+    "real-5.png"
   ],
   "created_by": "scripts/build_sunsky_alpha.py",
-  "calibration_note": "This bootstrap alpha is derived from templates/watermark-template.png. Future runs can replace it with averaged alpha solves from high-confidence OCR-localized samples without changing the engine API."
+  "calibration_note": "Alpha was solved from sample watermark crops using the same local-background solver used by SunskyAlphaEngine. The canonical template remains the support mask."
 }

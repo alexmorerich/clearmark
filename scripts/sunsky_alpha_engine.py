@@ -23,6 +23,7 @@ ALPHA_FLOOR = 0.015
 ALPHA_MAX = 0.92
 FINAL_ALPHA_TEMPLATE_MAX = 0.08
 MIN_ALPHA_RESIDUAL_REDUCTION = 0.55
+SOLVED_ALPHA_GAINS = [0.90, 1.00, 1.10]
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,14 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     return inter / union if union else 0.0
 
 
+def _as_bgr(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] == 4:
+        return image[:, :, :3].copy()
+    return image.copy()
+
+
 def extract_polarity_aware_sunsky_mask(image_bgr: np.ndarray) -> np.ndarray:
     if image_bgr.ndim == 2:
         gray = image_bgr
@@ -193,6 +202,122 @@ def apply_reverse_alpha(
 
     out = src.copy()
     out[mask] = restored[mask]
+    return out
+
+
+def fill_alpha_support_with_background(
+    image_bgr: np.ndarray,
+    support_alpha: np.ndarray,
+    *,
+    support_floor: float = ALPHA_FLOOR,
+) -> np.ndarray | None:
+    if support_alpha is None or support_alpha.size == 0 or image_bgr.size == 0:
+        return None
+    source = _as_bgr(image_bgr)
+    if support_alpha.shape[:2] != source.shape[:2]:
+        return None
+    support = support_alpha.astype(np.float32) >= support_floor
+    if not np.any(support):
+        return None
+
+    ys, xs = np.where(support)
+    img_h, img_w = source.shape[:2]
+    x1 = max(0, int(xs.min()) - 10)
+    y1 = max(0, int(ys.min()) - 8)
+    x2 = min(img_w, int(xs.max()) + 11)
+    y2 = min(img_h, int(ys.max()) + 9)
+    crop = source[y1:y2, x1:x2]
+    support_crop = support[y1:y2, x1:x2]
+    mask = cv2.dilate(support_crop.astype(np.uint8) * 255, np.ones((3, 5), np.uint8), iterations=1)
+    ring = cv2.dilate(support_crop.astype(np.uint8), np.ones((7, 13), np.uint8), iterations=1).astype(bool)
+    ring &= ~support_crop
+    if int(np.count_nonzero(ring)) >= 20 and float(np.mean(np.std(crop[ring], axis=0))) < 8.0:
+        fill = np.median(crop[ring], axis=0)
+        background = np.zeros_like(crop)
+        background[:, :] = np.uint8(np.clip(fill, 0, 255))
+    else:
+        background = cv2.inpaint(crop, mask, 3, cv2.INPAINT_TELEA)
+        background_blur = cv2.GaussianBlur(
+            background,
+            (max(5, min(31, ((min(crop.shape[:2]) // 2) * 2 + 1))),) * 2,
+            0,
+        )
+        background = cv2.addWeighted(background, 0.72, background_blur, 0.28, 0.0)
+    out = source.copy()
+    out_crop = out[y1:y2, x1:x2]
+    out_crop[support_crop] = background[support_crop]
+    out[y1:y2, x1:x2] = out_crop
+    return out
+
+
+def solve_alpha_map_from_background(
+    image_bgr: np.ndarray,
+    support_alpha: np.ndarray,
+    logo_bgr: tuple[float, float, float],
+    *,
+    support_floor: float = ALPHA_FLOOR,
+) -> np.ndarray:
+    """Estimate the per-pixel Sunsky overlay alpha inside an aligned support.
+
+    The static alpha asset is treated as a shape prior only. The actual alpha is
+    solved from a local inpainted background estimate so rows with different
+    anti-aliasing or opacity can still produce a candidate that reaches QA.
+    """
+    if support_alpha is None or support_alpha.size == 0 or image_bgr.size == 0:
+        return np.zeros(support_alpha.shape[:2] if support_alpha is not None else (1, 1), dtype=np.float32)
+
+    source = _as_bgr(image_bgr)
+    if support_alpha.shape[:2] != source.shape[:2]:
+        return np.zeros(source.shape[:2], dtype=np.float32)
+
+    support = support_alpha.astype(np.float32) >= support_floor
+    if not np.any(support):
+        return np.zeros(source.shape[:2], dtype=np.float32)
+
+    ys, xs = np.where(support)
+    img_h, img_w = source.shape[:2]
+    x1 = max(0, int(xs.min()) - 10)
+    y1 = max(0, int(ys.min()) - 8)
+    x2 = min(img_w, int(xs.max()) + 11)
+    y2 = min(img_h, int(ys.max()) + 9)
+    crop = source[y1:y2, x1:x2]
+    support_crop = support[y1:y2, x1:x2]
+
+    mask = cv2.dilate(support_crop.astype(np.uint8) * 255, np.ones((3, 5), np.uint8), iterations=1)
+    background = cv2.inpaint(crop, mask, 3, cv2.INPAINT_TELEA)
+    blur_w = max(5, min(31, ((min(crop.shape[:2]) // 2) * 2 + 1)))
+    background_blur = cv2.GaussianBlur(background, (blur_w, blur_w), 0)
+    background = cv2.addWeighted(background, 0.72, background_blur, 0.28, 0.0)
+
+    obs_luma = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bg_luma = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    logo_luma = float(np.mean(logo_bgr))
+
+    dark_denom = bg_luma - logo_luma
+    bright_denom = logo_luma - bg_luma
+    dark_alpha = np.divide(
+        bg_luma - obs_luma,
+        np.maximum(dark_denom, 1.0),
+        out=np.zeros_like(bg_luma, dtype=np.float32),
+        where=dark_denom > 6.0,
+    )
+    bright_alpha = np.divide(
+        obs_luma - bg_luma,
+        np.maximum(bright_denom, 1.0),
+        out=np.zeros_like(bg_luma, dtype=np.float32),
+        where=bright_denom > 6.0,
+    )
+    solved = np.maximum(dark_alpha, bright_alpha)
+    solved = np.where(support_crop, solved, 0.0)
+
+    prior = np.clip(support_alpha[y1:y2, x1:x2].astype(np.float32), 0.0, 1.0)
+    solved *= 0.55 + 0.45 * np.clip(prior / max(float(np.max(prior)), support_floor), 0.0, 1.0)
+    solved = cv2.medianBlur(np.uint8(np.clip(solved, 0.0, ALPHA_MAX) * 255.0), 3).astype(np.float32) / 255.0
+    solved = np.where(support_crop, solved, 0.0)
+    solved[solved < support_floor] = 0.0
+
+    out = np.zeros(source.shape[:2], dtype=np.float32)
+    out[y1:y2, x1:x2] = np.clip(solved, 0.0, ALPHA_MAX)
     return out
 
 
@@ -349,12 +474,7 @@ class SunskyAlphaEngine:
     ) -> list[SunskyAlphaCandidate]:
         if not self.alpha_available() or image_bgr.size == 0:
             return []
-        if image_bgr.ndim == 2:
-            source = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
-        elif image_bgr.shape[2] == 4:
-            source = image_bgr[:, :, :3].copy()
-        else:
-            source = image_bgr.copy()
+        source = _as_bgr(image_bgr)
 
         placements = self.align_alpha_to_mark_box(source, mark_box, roi_class=roi_class)
         candidates: list[SunskyAlphaCandidate] = []
@@ -402,12 +522,87 @@ class SunskyAlphaEngine:
                         residual_mask_area=int(np.count_nonzero(edge_mask)),
                     ))
 
+            for logo in logo_candidates:
+                solved_alpha = solve_alpha_map_from_background(source, full_alpha, logo)
+                solved_area = int(np.count_nonzero(solved_alpha >= ALPHA_FLOOR))
+                if solved_area <= 0:
+                    continue
+                if not risky:
+                    bg_support = np.maximum(solved_alpha, full_alpha)
+                    bg_fill = fill_alpha_support_with_background(source, bg_support)
+                    if bg_fill is not None:
+                        bg_residual = score_alpha_residual(bg_fill, mark_box, template)
+                        candidates.append(SunskyAlphaCandidate(
+                            name="sunsky_reverse_alpha_solved_bg_fill",
+                            image=bg_fill,
+                            alpha_map=bg_support,
+                            glyph_bbox=bbox,
+                            alignment_score=float(align_score),
+                            alpha_gain=1.0,
+                            logo_bgr=logo,
+                            residual_probe_score=float(bg_residual),
+                            residual_mask_area=solved_area,
+                        ))
+                for gain in SOLVED_ALPHA_GAINS:
+                    restored = apply_reverse_alpha(source, solved_alpha, logo, gain)
+                    residual = score_alpha_residual(restored, mark_box, template)
+                    candidates.append(SunskyAlphaCandidate(
+                        name="sunsky_reverse_alpha_solved",
+                        image=restored,
+                        alpha_map=solved_alpha,
+                        glyph_bbox=bbox,
+                        alignment_score=float(align_score),
+                        alpha_gain=float(gain),
+                        logo_bgr=logo,
+                        residual_probe_score=float(residual),
+                        residual_mask_area=solved_area,
+                    ))
+
+                    edge_mask = cv2.dilate((solved_alpha > 0.035).astype(np.uint8) * 255, edge_kernel, iterations=1)
+                    thin = cv2.inpaint(restored, edge_mask, inpaint_radius, cv2.INPAINT_NS)
+                    thin_residual = score_alpha_residual(thin, mark_box, template)
+                    candidates.append(SunskyAlphaCandidate(
+                        name="sunsky_reverse_alpha_solved_thin_ns",
+                        image=thin,
+                        alpha_map=np.maximum(solved_alpha, edge_mask.astype(np.float32) / 255.0 * 0.035),
+                        glyph_bbox=bbox,
+                        alignment_score=float(align_score),
+                        alpha_gain=float(gain),
+                        logo_bgr=logo,
+                        residual_probe_score=float(thin_residual),
+                        residual_mask_area=int(np.count_nonzero(edge_mask)),
+                    ))
+
         candidates.sort(key=lambda cand: (
             cand.residual_probe_score - cand.alignment_score * 0.22,
             cand.residual_probe_score,
             cand.residual_mask_area,
         ))
-        return candidates[:40]
+        top: list[SunskyAlphaCandidate] = []
+        seen: set[tuple[str, tuple[int, int, int, int], float, tuple[int, int, int], int]] = set()
+
+        def add(candidate: SunskyAlphaCandidate) -> None:
+            key = (
+                candidate.name,
+                candidate.glyph_bbox,
+                round(candidate.alpha_gain, 2),
+                tuple(int(round(v)) for v in candidate.logo_bgr),
+                int(round(candidate.residual_probe_score * 1000)),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            top.append(candidate)
+
+        for candidate in candidates:
+            add(candidate)
+            if len(top) >= 24:
+                break
+        for candidate in [item for item in candidates if "solved" in item.name]:
+            add(candidate)
+            if len(top) >= 40:
+                break
+        return top[:40]
 
     def remove_best(
         self,
