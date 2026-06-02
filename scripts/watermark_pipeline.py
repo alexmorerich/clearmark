@@ -2710,9 +2710,11 @@ def final_publish_gate(
         and int(metrics["post_text_components"]) <= FINAL_TEXT_COMPONENTS_MAX
         and (post_count == 0)
     )
+    ocr_checked = bool(ocr_meta.get("ocr_checked"))
     post_ocr_score = float(ocr_meta.get("ocr_watermark_score") or 0.0)
     sunsky_check_pass = (
-        not bool(ocr_meta.get("ocr_watermark"))
+        ocr_checked
+        and not bool(ocr_meta.get("ocr_watermark"))
         and post_ocr_score < OCR_POST_CLEAN_SUSPECT_MIN
     )
     dot_pass = not bool(dot_metrics.get("dot_chain_fail"))
@@ -2742,7 +2744,9 @@ def final_publish_gate(
         reject_reasons.append("visible_rectangular_band")
     if not product_pass:
         reject_reasons.append("product_damage")
-    if not sunsky_check_pass:
+    if not ocr_checked:
+        reject_reasons.append("post_clean_ocr_unchecked")
+    elif not sunsky_check_pass:
         reject_reasons.append("post_clean_sunsky_detected")
     if not alpha_pass:
         reject_reasons.append("alpha_template_residual")
@@ -2754,6 +2758,7 @@ def final_publish_gate(
         "metrics_valid": bool(metrics_valid),
         "residual_pass": bool(residual_pass),
         "sunsky_check_pass": bool(sunsky_check_pass),
+        "post_clean_ocr_checked": bool(ocr_checked),
         "post_clean_ocr_score": post_ocr_score,
         "dot_chain_pass": bool(dot_pass),
         "band_pass": bool(band_pass),
@@ -2774,7 +2779,7 @@ def candidate_failure_category(gate_meta: dict | None) -> str:
         return "candidate_failed_product_damage"
     if "visible_rectangular_band" in reasons:
         return "candidate_failed_band"
-    residual_reasons = {"residual_visible", "dot_chain_residual", "post_clean_sunsky_detected"}
+    residual_reasons = {"residual_visible", "dot_chain_residual", "post_clean_sunsky_detected", "alpha_template_residual"}
     if reasons and reasons.issubset(residual_reasons):
         return "candidate_failed_residual_only"
     if reasons & residual_reasons and not (reasons - residual_reasons):
@@ -2814,6 +2819,7 @@ def candidate_trace(candidate: RepairCandidate) -> dict:
         "product_fail": bool((candidate.product_metrics or {}).get("product_gate_fail")),
         "post_clean_detection_count": candidate.post_count,
         "post_clean_ocr_score": round(float((candidate.gate_meta or {}).get("post_clean_ocr_score") or 0.0), 4),
+        "post_clean_ocr_checked": bool((candidate.gate_meta or {}).get("post_clean_ocr_checked")),
         "post_text_components": int(candidate.metrics.get("post_text_components") or 0),
     }
 
@@ -3120,6 +3126,7 @@ def clean_image(
             "residual_score": round(float(cmetrics["residual_score"]), 4),
             "template_residual_score": round(float(cmetrics["template_residual_score"]), 4),
             "post_clean_ocr_score": round(float(cgate_meta.get("post_clean_ocr_score") or 0.0), 4),
+            "post_clean_ocr_checked": bool(cgate_meta.get("post_clean_ocr_checked")),
             "post_text_components": int(cmetrics.get("post_text_components") or 0),
             "dot_chain_score": round(float(cdot_metrics.get("dot_chain_score") or 0.0), 4),
             "visible_band_score": round(float(cband_metrics.get("visible_band_score") or 0.0), 4),
@@ -3316,6 +3323,7 @@ def clean_image(
         "metrics_valid": gate_meta["metrics_valid"],
         "residual_pass": gate_meta["residual_pass"],
         "sunsky_check_pass": gate_meta["sunsky_check_pass"],
+        "post_clean_ocr_checked": gate_meta["post_clean_ocr_checked"],
         "post_clean_ocr_score": round(float(gate_meta["post_clean_ocr_score"]), 4),
         "dot_chain_pass": gate_meta["dot_chain_pass"],
         "band_pass": gate_meta["band_pass"],
@@ -3423,6 +3431,11 @@ def clean_all_detections(
         for item in details
         if isinstance(item.get("post_clean_ocr_score"), (int, float))
     ]
+    post_clean_ocr_checked = [
+        bool(item["post_clean_ocr_checked"])
+        for item in details
+        if "post_clean_ocr_checked" in item
+    ]
     alpha_alignment_scores = [
         float(item["alpha_alignment_score"])
         for item in details
@@ -3483,6 +3496,7 @@ def clean_all_detections(
         "post_text_score": round(max(text_scores), 4) if text_scores else 0.0,
         "post_text_components": max(text_components) if text_components else 0,
         "post_clean_ocr_score": round(max(post_clean_ocr_scores), 4) if post_clean_ocr_scores else None,
+        "post_clean_ocr_checked": all(post_clean_ocr_checked) if post_clean_ocr_checked else False,
         "sunsky_check_pass": all(sunsky_check_passes) if sunsky_check_passes else None,
         "alpha_engine_used": any(bool(item.get("alpha_engine_used")) for item in details),
         "alpha_asset": str(SUNSKY_ALPHA_PATH.relative_to(PROJECT_ROOT)) if SUNSKY_ALPHA_PATH.exists() else "",
@@ -3888,6 +3902,7 @@ def process_file(
     review: bool,
     ocr_reader=None,
     require_presence_confirmed: bool = False,
+    write_no_watermark_review: bool = True,
 ) -> dict:
     img = cv2.imread(str(path))
     if img is None:
@@ -3897,7 +3912,7 @@ def process_file(
     detections = detect_watermark(gray, templates, preset, img=img, ocr_reader=ocr_reader, layout=layout)
     if not detections:
         entry = {"file": path.name, "status": "no_watermark", "layout": layout}
-        if review:
+        if review and write_no_watermark_review:
             original_path = out_dir / "originals" / path.name
             original_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, original_path)
@@ -3914,9 +3929,9 @@ def process_file(
             entry["review_diff"] = f"diffs/{path.name}"
         return entry
     presence = confirm_watermark_presence(img, gray, detections, ocr_reader, layout=layout)
-    if require_presence_confirmed and not presence.get("presence_confirmed"):
+    if not presence.get("presence_confirmed"):
         entry = {"file": path.name, "status": "no_watermark", **presence, "layout": layout}
-        if review:
+        if review and write_no_watermark_review:
             original_path = out_dir / "originals" / path.name
             original_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, original_path)
@@ -4016,6 +4031,7 @@ def cmd_pilot(args: argparse.Namespace) -> None:
             review=True,
             ocr_reader=ocr_reader,
             require_presence_confirmed=args.watermarked_only,
+            write_no_watermark_review=not args.watermarked_only,
         )
         if args.watermarked_only and row["status"] == "no_watermark":
             skipped_no_watermark += 1

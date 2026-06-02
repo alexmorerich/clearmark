@@ -25,6 +25,7 @@ templates/
   sunsky-alpha-meta.json      alpha asset metadata and provenance
 tests/
   test_sunsky_alpha_engine.py synthetic recovery and safety tests
+  test_pipeline_safety.py      publish-gate and no-mark regression tests
 ```
 
 ## Execution Flow
@@ -43,7 +44,7 @@ inventory images
    -> Telea / Navier-Stokes inpaint
    -> optional LaMa escalation
    -> residual-only cleanup
--> run the unchanged final publish gate
+-> run the strict final publish gate
 -> write cleaned/ only for gate-passed outputs
 -> write attempts/ for failed best attempts
 -> write review.html, compare.pdf, manifest.jsonl, summary.json
@@ -63,7 +64,7 @@ ClearMark treats position detection as a three-step evidence problem: propose, c
 - Low-contrast text-band priors for faint watermark recall.
 - Bright-background recall for pale gray marks on near-white product photos.
 
-Priors are recall helpers only. They do not become publishable evidence by themselves when OCR or template evidence disagrees.
+Priors are recall helpers only. They do not become publishable evidence by themselves when OCR or template evidence disagrees. If Sunsky presence is not confirmed, the image is returned as `no_watermark` and does not enter the cleaning stage.
 
 ### Sunsky Text Confirmation
 
@@ -227,14 +228,14 @@ A cleaned candidate must pass:
 - residual visibility score;
 - canonical template residual score;
 - alpha-template residual score;
-- post-clean OCR Sunsky check;
+- post-clean OCR Sunsky check, which must actually run before publishing;
 - post-clean detector count;
 - dot-chain residual detection;
 - visible rectangular band detection;
 - product-damage detection;
 - required metric validity checks.
 
-If any required signal fails, the image is marked `needs_manual`.
+If any required signal fails, the image is marked `needs_manual`. Runs with `--no-ocr` are useful for fast review diagnostics, but they cannot write automatic `cleaned/` outputs because the independent OCR double-check is unavailable.
 
 ### Residual Watermark Criteria
 
@@ -327,8 +328,9 @@ python3 scripts/watermark_pipeline.py pilot \
 ClearMark does not:
 
 - modify source images;
+- clean images whose Sunsky presence is not confirmed;
 - write failed repairs to `cleaned/`;
-- publish when OCR still reads Sunsky;
+- publish when OCR still reads Sunsky or when post-clean OCR was not checked;
 - disable dot-chain, visible-band, product-damage, or alpha-template gates;
 - use broad rectangle fills over product-overlap regions;
 - strip metadata, remove invisible watermarks, regenerate images, or perform general AI-label removal.
