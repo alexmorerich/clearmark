@@ -165,3 +165,123 @@ def test_alpha_candidates_are_reserved_for_gate_evaluation(monkeypatch) -> None:
         for trace in meta.get("candidate_gate_trace", [])
         if trace["strategy"].startswith("sunsky_reverse_alpha")
     )
+
+
+def test_residual_second_pass_uses_roi_specific_repairs(monkeypatch) -> None:
+    image = np.full((120, 220, 3), 58, np.uint8)
+    cv2.putText(image, "sunsky-online.com", (36, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (138, 138, 138), 1, cv2.LINE_AA)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=32,
+        y=48,
+        w=160,
+        h=28,
+        score=0.88,
+        verify_score=0.86,
+        template="watermark-template.png",
+        scale=1.0,
+        mark_box={"x": 32, "y": 48, "w": 160, "h": 28},
+        mask_area_pct=0.7,
+        text_score=0.90,
+        text_components=12,
+        contrast_span=16.0,
+        line_dominance=0.25,
+        confidence=0.92,
+        roi_class="dark_product_surface",
+    )
+
+    cleanup_mask = np.zeros(gray.shape, np.uint8)
+    cleanup_mask[58:62, 82:116] = 255
+    roi_repair = image.copy()
+    roi_repair[0, 0] = (77, 77, 77)
+
+    monkeypatch.setattr(pipeline, "ENABLE_LAMA_ESCALATION", False)
+    monkeypatch.setattr(pipeline, "sunsky_alpha_engine", lambda: None)
+    monkeypatch.setattr(pipeline, "create_mask", lambda *args, **kwargs: (cleanup_mask, pipeline._mask_area(cleanup_mask)))
+    monkeypatch.setattr(
+        pipeline,
+        "build_residual_cleanup_mask",
+        lambda *args, **kwargs: (
+            cleanup_mask,
+            {"eligible": True, "reason": "unit_residual_evidence_mask", "category": "candidate_failed_residual_only"},
+        ),
+    )
+
+    def fake_roi_repairs(original, candidate, mask, detection):
+        return [(
+            "dark_surface_low_alpha_scrub",
+            roi_repair,
+            mask,
+            {
+                "operator": "dark_surface_low_alpha_scrub",
+                "dark_surface_scrub_used": True,
+                "protected_edge_loss": 0.0,
+                "repair_mask_area_pct": pipeline._mask_area(mask) * 100,
+            },
+        )]
+
+    monkeypatch.setattr(pipeline, "roi_specific_repair_candidates", fake_roi_repairs)
+
+    residual_metrics = {
+        "residual_score": 0.55,
+        "template_residual_score": 0.34,
+        "post_text_score": 0.80,
+        "post_text_components": 4,
+    }
+    clean_metrics = {
+        "residual_score": 0.03,
+        "template_residual_score": 0.02,
+        "post_text_score": 0.01,
+        "post_text_components": 0,
+    }
+    dot_metrics = {
+        "dot_chain_score": 0.0,
+        "dot_component_count": 0,
+        "dot_horizontal_span": 0.0,
+        "dot_component_area_ratio": 0.0,
+        "dot_chain_fail": False,
+        "component_mask": cleanup_mask,
+    }
+    band_metrics = {"band_gate_fail": False, "visible_band_score": 0.0, "band_luma_delta": 0.0, "band_edge_box": 0.0}
+    product_metrics = {
+        "product_gate_fail": False,
+        "product_color_delta": 0.0,
+        "product_edge_retention": 1.0,
+        "product_blob_score": 0.0,
+        "product_changed_area_ratio": 0.0,
+    }
+    alpha_metrics = {
+        "alpha_checked": True,
+        "alpha_template_residual_before": 0.04,
+        "alpha_template_residual_after": 0.02,
+        "alpha_residual_reduction": 0.70,
+    }
+
+    def fake_evaluate(original, candidate, mask, detection, templates, ocr_reader):
+        metrics = clean_metrics if int(candidate[0, 0, 0]) == 77 else residual_metrics
+        ocr_meta = {"ocr_checked": True, "ocr_watermark": False, "ocr_watermark_score": 0.0}
+        gate = pipeline.final_publish_gate(metrics, 0, ocr_meta, dot_metrics, band_metrics, product_metrics, alpha_metrics)
+        return (
+            cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY),
+            metrics,
+            0,
+            ocr_meta,
+            dot_metrics,
+            band_metrics,
+            product_metrics,
+            alpha_metrics,
+            gate,
+        )
+
+    monkeypatch.setattr(pipeline, "evaluate_cleaned_output", fake_evaluate)
+
+    cleaned, mask, meta = pipeline.clean_image(image, gray, det, pipeline.load_templates(), ocr_reader=object())
+
+    assert cleaned is not None
+    assert mask is not None
+    assert meta["status"] == "cleaned"
+    assert meta["residual_cleanup_eligible"] is True
+    assert meta["second_pass_attempted"] is True
+    assert meta["cleanup_strategy"] == "dark_surface_low_alpha_scrub"
+    assert meta["roi_repair_operator"] == "dark_surface_low_alpha_scrub"
+    assert meta["dark_surface_scrub_used"] is True

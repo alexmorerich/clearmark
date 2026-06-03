@@ -44,6 +44,8 @@ inventory images
    -> Telea / Navier-Stokes inpaint
    -> optional LaMa escalation
    -> residual-only cleanup
+      -> residual evidence mask
+      -> row/ring fill, thin inpaint, and ROI-specific repair candidates
 -> run the strict final publish gate
 -> write cleaned/ only for gate-passed outputs
 -> write attempts/ for failed best attempts
@@ -166,8 +168,10 @@ Candidate strategy names include:
 ```text
 sunsky_reverse_alpha_aligned
 sunsky_reverse_alpha_aligned_thin_ns
+sunsky_reverse_alpha_aligned_thin_ns_r2
 sunsky_reverse_alpha_solved
 sunsky_reverse_alpha_solved_thin_ns
+sunsky_reverse_alpha_solved_thin_ns_r2
 sunsky_reverse_alpha_solved_bg_fill
 ```
 
@@ -179,10 +183,17 @@ Reverse-alpha removes the blended watermark first. A tiny Navier-Stokes pass can
 
 Rules:
 
-- radius is 1 for risky product regions;
+- radius 1 remains the conservative option for risky product regions;
+- radius 2 is also generated as a stronger risky-region candidate when residual evidence remains;
 - radius is 2 for safer low-texture regions;
 - cleanup never uses a full mark-box rectangle;
 - product detail, cables, and labels still have to pass product-damage QA.
+
+### Residual-Driven Second Pass
+
+If a first-pass candidate fails only because watermark evidence remains, ClearMark builds a second-pass mask with `build_residual_cleanup_mask()`. This mask combines the original glyph mask, post-clean residual text components, dot-chain evidence, template halo evidence, and OCR-supported text-line coverage. It is anisotropically dilated: wider horizontally along the Sunsky baseline and tighter vertically to avoid product damage.
+
+The second pass is not allowed when the blocker is a visible band, product damage, missing metrics, uncertain detection, or an oversized mask. Eligible residual masks feed row/ring fill, residual inpaint, and the ROI-specific operators listed below. The final publish gate is run again after every second-pass candidate.
 
 ### Near-White Row Fill
 
@@ -296,6 +307,18 @@ Each processed image records diagnostic fields such as:
   "thin_residual_inpaint": true,
   "candidate_count": 0,
   "best_candidate_id": "",
+  "first_pass_reason": "",
+  "second_pass_attempted": false,
+  "second_pass_strategy": "",
+  "second_pass_mask_area_pct": 0.0,
+  "second_pass_reason": "",
+  "residual_cleanup_eligible": false,
+  "residual_cleanup_reason": "",
+  "roi_repair_operator": "",
+  "dark_surface_scrub_used": false,
+  "protected_edge_loss": 0.0,
+  "cable_silhouette_delta": 0.0,
+  "clone_similarity": 0.0,
   "final_blocker_type": "residual_watermark"
 }
 ```
@@ -329,7 +352,6 @@ python3 scripts/watermark_pipeline.py pilot \
   --max-scan 700 \
   --watermarked-only \
   --preset review \
-  --no-lama \
   --pdf \
   --telegram \
   --out /Users/alexkou/Downloads/clearmark-alpha-v1 \

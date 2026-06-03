@@ -3007,7 +3007,7 @@ def clean_image(
                 "alpha_best_gain": float(alpha_candidate.alpha_gain),
                 "alpha_best_logo_bgr": [float(v) for v in alpha_candidate.logo_bgr],
                 "alpha_residual_probe_score": float(alpha_candidate.residual_probe_score),
-                "thin_residual_inpaint": alpha_candidate.name.endswith("_thin_ns"),
+                "thin_residual_inpaint": "_thin_ns" in alpha_candidate.name,
                 "alpha_bbox": {
                     "x": int(alpha_candidate.glyph_bbox[0]),
                     "y": int(alpha_candidate.glyph_bbox[1]),
@@ -3250,9 +3250,13 @@ def clean_image(
     broad_mask = area > 0.020 or (not name.startswith("glyph_") and area > 0.012)
     position_confident = not det.template.startswith("prior:")
 
+    first_pass_reason = ";".join(dict.fromkeys(gate_meta["reject_reasons"]))
     cleanup_attempted = False
     cleanup_strategy = ""
     cleanup_mask_area = 0.0
+    cleanup_selected_meta: dict = {}
+    residual_cleanup_meta: dict = {"eligible": False, "reason": ""}
+    residual_cleanup_eligible = False
     cleanup_reasons = set(gate_meta["reject_reasons"])
     residual_cleanup_needed = (
         not gate_meta["publish_ok"]
@@ -3266,28 +3270,68 @@ def clean_image(
         and "visible_rectangular_band" not in cleanup_reasons
     )
     if residual_cleanup_needed:
-        cleanup_attempted = True
-        cleanup_candidates: list[tuple[str, np.ndarray, np.ndarray, float]] = []
-        ring_cleanup = cleanup_residual_components_with_ring_fill(best, dot_metrics["component_mask"], det)
-        if ring_cleanup is not None:
-            ring_mask = cv2.dilate((dot_metrics["component_mask"] > 0).astype(np.uint8) * 255, np.ones((3, 5), np.uint8), iterations=1)
-            ring_area = float(np.count_nonzero(ring_mask)) / max(1, ring_mask.size)
-            cleanup_candidates.append(("residual_ring_fill", ring_cleanup, ring_mask, ring_area))
-        inpaint_cleanup, inpaint_mask, inpaint_area = cleanup_residual_components_with_inpaint(
+        residual_cleanup_mask, residual_cleanup_meta = build_residual_cleanup_mask(
+            img,
             best,
-            dot_metrics["component_mask"],
+            mask,
+            det.mark_box,
+            det.roi_class,
             det,
-            risky=risky_product_roi,
+            {
+                "gate_meta": gate_meta,
+                "metrics": metrics,
+                "dot_metrics": dot_metrics,
+                "ocr_meta": ocr_meta,
+            },
         )
-        if inpaint_cleanup is not None and inpaint_mask is not None:
-            cleanup_candidates.append(("residual_component_inpaint", inpaint_cleanup, inpaint_mask, inpaint_area))
+        residual_cleanup_eligible = bool(residual_cleanup_meta.get("eligible"))
+        cleanup_candidates: list[tuple[str, np.ndarray, np.ndarray, float, dict]] = []
+        if residual_cleanup_eligible and np.count_nonzero(residual_cleanup_mask) >= 4:
+            cleanup_attempted = True
+            ring_cleanup = cleanup_residual_components_with_ring_fill(best, residual_cleanup_mask, det)
+            if ring_cleanup is not None:
+                ring_mask = cv2.dilate(
+                    (residual_cleanup_mask > 0).astype(np.uint8) * 255,
+                    np.ones((3, 5), np.uint8),
+                    iterations=1,
+                )
+                ring_area = float(np.count_nonzero(ring_mask)) / max(1, ring_mask.size)
+                cleanup_candidates.append((
+                    "residual_ring_fill",
+                    ring_cleanup,
+                    ring_mask,
+                    ring_area,
+                    {"operator": "residual_ring_fill"},
+                ))
+            inpaint_cleanup, inpaint_mask, inpaint_area = cleanup_residual_components_with_inpaint(
+                best,
+                residual_cleanup_mask,
+                det,
+                risky=risky_product_roi,
+            )
+            if inpaint_cleanup is not None and inpaint_mask is not None:
+                cleanup_candidates.append((
+                    "residual_component_inpaint",
+                    inpaint_cleanup,
+                    inpaint_mask,
+                    inpaint_area,
+                    {"operator": "residual_component_inpaint"},
+                ))
+            for roi_name, roi_cleanup, roi_mask, roi_meta in roi_specific_repair_candidates(
+                img,
+                best,
+                residual_cleanup_mask,
+                det,
+            ):
+                roi_area = float(np.count_nonzero(roi_mask)) / max(1, roi_mask.size)
+                cleanup_candidates.append((roi_name, roi_cleanup, roi_mask, roi_area, roi_meta))
 
         best_cleanup_score = (
             float(metrics["residual_score"])
             + float(metrics["template_residual_score"]) * 0.35
             + (1.0 if ocr_meta.get("ocr_watermark") else 0.0)
         )
-        for cname, cleanup, cleanup_mask, carea in cleanup_candidates:
+        for cname, cleanup, cleanup_mask, carea, repair_meta in cleanup_candidates:
             combined_cleanup_mask = cv2.bitwise_or(mask, cleanup_mask)
             (
                 cgray,
@@ -3303,10 +3347,33 @@ def clean_image(
             cleanup_score = (
                 float(cleanup_metrics["residual_score"])
                 + float(cleanup_metrics["template_residual_score"]) * 0.35
+                + float(cleanup_alpha_metrics.get("alpha_template_residual_after") or 0.0) * 0.55
                 + (1.0 if cleanup_ocr_meta.get("ocr_watermark") else 0.0)
                 + (0.50 if cleanup_product_metrics.get("product_gate_fail") else 0.0)
                 + (0.35 if cleanup_band_metrics.get("band_gate_fail") else 0.0)
             )
+            cleanup_trace_id = f"cleanup_{len(candidate_traces):02d}"
+            candidate_traces.append({
+                "candidate_id": cleanup_trace_id,
+                "strategy": f"{name}_{cname}",
+                "category": candidate_failure_category(cleanup_gate),
+                "rank_score": round(float(-cleanup_score), 5),
+                "residual_score": round(float(cleanup_metrics["residual_score"]), 4),
+                "template_residual_score": round(float(cleanup_metrics["template_residual_score"]), 4),
+                "post_clean_ocr_score": round(float(cleanup_gate.get("post_clean_ocr_score") or 0.0), 4),
+                "post_clean_ocr_checked": bool(cleanup_gate.get("post_clean_ocr_checked")),
+                "post_text_components": int(cleanup_metrics.get("post_text_components") or 0),
+                "dot_chain_score": round(float(cleanup_dot_metrics.get("dot_chain_score") or 0.0), 4),
+                "visible_band_score": round(float(cleanup_band_metrics.get("visible_band_score") or 0.0), 4),
+                "product_blob_score": round(float(cleanup_product_metrics.get("product_blob_score") or 0.0), 4),
+                "alpha_alignment_score": round(float(selected_extra.get("alpha_alignment_score") or 0.0), 4),
+                "alpha_template_residual_after": round(float(cleanup_alpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
+                "reject_reasons": list(cleanup_gate.get("reject_reasons") or []),
+                "second_pass": True,
+                "second_pass_strategy": cname,
+                "second_pass_mask_area_pct": round(float(carea) * 100, 3),
+                "roi_repair_operator": repair_meta.get("operator", cname),
+            })
             meaningful_improvement = cleanup_score <= best_cleanup_score - 0.08
             if cleanup_gate["publish_ok"] or meaningful_improvement:
                 best_cleanup_score = cleanup_score
@@ -3326,6 +3393,7 @@ def clean_image(
                 area = float(np.count_nonzero(mask)) / max(1, mask.size)
                 cleanup_strategy = cname
                 cleanup_mask_area = carea
+                cleanup_selected_meta = repair_meta
                 name = f"{name}_{cname}"
 
     status = gate_meta["status"]
@@ -3387,6 +3455,21 @@ def clean_image(
         "cleanup_attempted": cleanup_attempted,
         "cleanup_strategy": cleanup_strategy,
         "cleanup_mask_area_pct": round(cleanup_mask_area * 100, 3),
+        "first_pass_reason": first_pass_reason,
+        "second_pass_attempted": cleanup_attempted,
+        "second_pass_strategy": cleanup_strategy,
+        "second_pass_mask_area_pct": round(cleanup_mask_area * 100, 3),
+        "second_pass_reason": residual_cleanup_meta.get("reason", ""),
+        "residual_cleanup_eligible": residual_cleanup_eligible,
+        "residual_cleanup_reason": residual_cleanup_meta.get("reason", ""),
+        "residual_cleanup_category": residual_cleanup_meta.get("category", ""),
+        "roi_repair_operator": cleanup_selected_meta.get("operator", ""),
+        "dark_surface_scrub_used": bool(cleanup_selected_meta.get("dark_surface_scrub_used")),
+        "protected_edge_loss": round(float(cleanup_selected_meta.get("protected_edge_loss") or 0.0), 4),
+        "cable_silhouette_delta": round(float(cleanup_selected_meta.get("cable_silhouette_delta") or 0.0), 4),
+        "clone_similarity": round(float(cleanup_selected_meta.get("similarity") or 0.0), 4),
+        "solid_color_edge_density": round(float(cleanup_selected_meta.get("edge_density") or 0.0), 4),
+        "solid_color_std": round(float(cleanup_selected_meta.get("color_std") or 0.0), 4),
         "candidate_count": len(candidates),
         "alpha_candidates_generated": alpha_candidates_generated,
         "alpha_candidates_evaluated": alpha_candidates_evaluated,
@@ -3528,6 +3611,26 @@ def clean_all_detections(
         for item in details
         if isinstance(item.get("candidate_count"), int)
     ]
+    second_pass_strategies = [
+        str(item.get("second_pass_strategy"))
+        for item in details
+        if item.get("second_pass_strategy")
+    ]
+    first_pass_reasons = [
+        str(item.get("first_pass_reason"))
+        for item in details
+        if item.get("first_pass_reason")
+    ]
+    second_pass_reasons = [
+        str(item.get("second_pass_reason"))
+        for item in details
+        if item.get("second_pass_reason")
+    ]
+    roi_repair_operators = [
+        str(item.get("roi_repair_operator"))
+        for item in details
+        if item.get("roi_repair_operator")
+    ]
     sunsky_check_passes = [
         bool(item["sunsky_check_pass"])
         for item in details
@@ -3578,6 +3681,61 @@ def clean_all_detections(
         "thin_residual_inpaint": any(bool(item.get("thin_residual_inpaint")) for item in details),
         "candidate_count": sum(repair_candidate_counts) if repair_candidate_counts else 0,
         "best_candidate_id": next((str(item.get("best_candidate_id")) for item in details if item.get("best_candidate_id")), ""),
+        "first_pass_reason": ";".join(dict.fromkeys(first_pass_reasons)),
+        "second_pass_attempted": any(bool(item.get("second_pass_attempted")) for item in details),
+        "second_pass_strategy": ",".join(dict.fromkeys(second_pass_strategies)),
+        "second_pass_mask_area_pct": round(
+            max(
+                [
+                    float(item.get("second_pass_mask_area_pct") or 0.0)
+                    for item in details
+                    if isinstance(item.get("second_pass_mask_area_pct"), (int, float))
+                ],
+                default=0.0,
+            ),
+            3,
+        ),
+        "second_pass_reason": ";".join(dict.fromkeys(second_pass_reasons)),
+        "residual_cleanup_eligible": any(bool(item.get("residual_cleanup_eligible")) for item in details),
+        "residual_cleanup_reason": next(
+            (str(item.get("residual_cleanup_reason")) for item in details if item.get("residual_cleanup_reason")),
+            "",
+        ),
+        "roi_repair_operator": ",".join(dict.fromkeys(roi_repair_operators)),
+        "dark_surface_scrub_used": any(bool(item.get("dark_surface_scrub_used")) for item in details),
+        "protected_edge_loss": round(
+            max(
+                [
+                    float(item.get("protected_edge_loss") or 0.0)
+                    for item in details
+                    if isinstance(item.get("protected_edge_loss"), (int, float))
+                ],
+                default=0.0,
+            ),
+            4,
+        ),
+        "cable_silhouette_delta": round(
+            max(
+                [
+                    float(item.get("cable_silhouette_delta") or 0.0)
+                    for item in details
+                    if isinstance(item.get("cable_silhouette_delta"), (int, float))
+                ],
+                default=0.0,
+            ),
+            4,
+        ),
+        "clone_similarity": round(
+            max(
+                [
+                    float(item.get("clone_similarity") or 0.0)
+                    for item in details
+                    if isinstance(item.get("clone_similarity"), (int, float))
+                ],
+                default=0.0,
+            ),
+            4,
+        ),
         "final_blocker_type": next((str(item.get("final_blocker_type")) for item in details if item.get("final_blocker_type") != "none"), "none"),
         "detection_results": details,
     }

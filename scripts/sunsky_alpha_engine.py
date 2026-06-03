@@ -480,7 +480,7 @@ class SunskyAlphaEngine:
         candidates: list[SunskyAlphaCandidate] = []
         risky = roi_class in {"dark_product_surface", "thin_flex_cable", "complex_product_detail", "text_or_label_area"}
         edge_kernel = np.ones((3, 3), np.uint8) if risky else np.ones((3, 5), np.uint8)
-        inpaint_radius = 1 if risky else 2
+        inpaint_radii = [1, 2] if risky else [2]
         template = self.alpha if self.alpha is not None else np.ones((4, 16), dtype=np.float32)
         logo_candidates = []
         for logo in [self.logo_bgr, *LOGO_BGR_CANDIDATES]:
@@ -508,19 +508,24 @@ class SunskyAlphaEngine:
                     ))
 
                     edge_mask = cv2.dilate((full_alpha > 0.04).astype(np.uint8) * 255, edge_kernel, iterations=1)
-                    thin = cv2.inpaint(restored, edge_mask, inpaint_radius, cv2.INPAINT_NS)
-                    thin_residual = score_alpha_residual(thin, mark_box, template)
-                    candidates.append(SunskyAlphaCandidate(
-                        name="sunsky_reverse_alpha_aligned_thin_ns",
-                        image=thin,
-                        alpha_map=np.maximum(full_alpha, edge_mask.astype(np.float32) / 255.0 * 0.04),
-                        glyph_bbox=bbox,
-                        alignment_score=float(align_score),
-                        alpha_gain=float(gain),
-                        logo_bgr=logo,
-                        residual_probe_score=float(thin_residual),
-                        residual_mask_area=int(np.count_nonzero(edge_mask)),
-                    ))
+                    for radius in inpaint_radii:
+                        thin = cv2.inpaint(restored, edge_mask, radius, cv2.INPAINT_NS)
+                        thin_residual = score_alpha_residual(thin, mark_box, template)
+                        candidates.append(SunskyAlphaCandidate(
+                            name=(
+                                "sunsky_reverse_alpha_aligned_thin_ns"
+                                if radius == 1 or not risky
+                                else "sunsky_reverse_alpha_aligned_thin_ns_r2"
+                            ),
+                            image=thin,
+                            alpha_map=np.maximum(full_alpha, edge_mask.astype(np.float32) / 255.0 * 0.04),
+                            glyph_bbox=bbox,
+                            alignment_score=float(align_score),
+                            alpha_gain=float(gain),
+                            logo_bgr=logo,
+                            residual_probe_score=float(thin_residual),
+                            residual_mask_area=int(np.count_nonzero(edge_mask)),
+                        ))
 
             for logo in logo_candidates:
                 solved_alpha = solve_alpha_map_from_background(source, full_alpha, logo)
@@ -559,19 +564,24 @@ class SunskyAlphaEngine:
                     ))
 
                     edge_mask = cv2.dilate((solved_alpha > 0.035).astype(np.uint8) * 255, edge_kernel, iterations=1)
-                    thin = cv2.inpaint(restored, edge_mask, inpaint_radius, cv2.INPAINT_NS)
-                    thin_residual = score_alpha_residual(thin, mark_box, template)
-                    candidates.append(SunskyAlphaCandidate(
-                        name="sunsky_reverse_alpha_solved_thin_ns",
-                        image=thin,
-                        alpha_map=np.maximum(solved_alpha, edge_mask.astype(np.float32) / 255.0 * 0.035),
-                        glyph_bbox=bbox,
-                        alignment_score=float(align_score),
-                        alpha_gain=float(gain),
-                        logo_bgr=logo,
-                        residual_probe_score=float(thin_residual),
-                        residual_mask_area=int(np.count_nonzero(edge_mask)),
-                    ))
+                    for radius in inpaint_radii:
+                        thin = cv2.inpaint(restored, edge_mask, radius, cv2.INPAINT_NS)
+                        thin_residual = score_alpha_residual(thin, mark_box, template)
+                        candidates.append(SunskyAlphaCandidate(
+                            name=(
+                                "sunsky_reverse_alpha_solved_thin_ns"
+                                if radius == 1 or not risky
+                                else "sunsky_reverse_alpha_solved_thin_ns_r2"
+                            ),
+                            image=thin,
+                            alpha_map=np.maximum(solved_alpha, edge_mask.astype(np.float32) / 255.0 * 0.035),
+                            glyph_bbox=bbox,
+                            alignment_score=float(align_score),
+                            alpha_gain=float(gain),
+                            logo_bgr=logo,
+                            residual_probe_score=float(thin_residual),
+                            residual_mask_area=int(np.count_nonzero(edge_mask)),
+                        ))
 
         candidates.sort(key=lambda cand: (
             cand.residual_probe_score - cand.alignment_score * 0.22,
