@@ -2553,6 +2553,138 @@ def near_area_background_fill_repair(
     return candidate, effective_mask, area, float(bg_fraction)
 
 
+def solid_background_direct_cover_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    mask: np.ndarray,
+    det: Detection,
+    *,
+    risky: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Directly cover confirmed watermark pixels on plain/solid color surfaces.
+
+    This is intentionally different from inpaint: when the mark sits on a
+    uniform white or solid plane, the best repair is the local background color
+    itself. The target still stays evidence-bound to the OCR/template text line.
+    """
+    if mask is None or np.count_nonzero(mask) == 0:
+        return None, None, 0.0, {"reason": "empty_mask"}
+
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    tail_px = int(round(b["w"] * max(TAIL_EXPAND_RATIO_X, 0.10)))
+    tail_px = max(TAIL_EXPAND_MIN_PX, min(max(TAIL_EXPAND_MAX_PX, 22), tail_px))
+    line_pad_y = max(2, int(round(b["h"] * (0.24 if risky else 0.32))))
+    x1 = max(0, b["x"] - tail_px)
+    x2 = min(img_w, b["x"] + b["w"] + tail_px)
+    y1 = max(0, b["y"] - line_pad_y)
+    y2 = min(img_h, b["y"] + b["h"] + line_pad_y)
+    line_band = np.zeros_like(gray, dtype=np.uint8)
+    line_band[y1:y2, x1:x2] = 255
+
+    glyph_halo = create_glyph_halo_mask(
+        canonical_ink_mask(),
+        b,
+        6 if not risky else 4,
+        2 if not risky else 1,
+        gray.shape[:2],
+    )
+    glyph_halo = cv2.bitwise_or(glyph_halo, (mask > 0).astype(np.uint8) * 255)
+    tail_kernel_w = max(7, min(23, (tail_px // 2) * 2 + 1))
+    text_line = cv2.dilate(glyph_halo, cv2.getStructuringElement(cv2.MORPH_RECT, (tail_kernel_w, 3)), iterations=1)
+    text_line = cv2.bitwise_and(text_line, line_band)
+
+    blur_k = max(9, min(51, (max(5, b["h"] * 3) // 2) * 2 + 1))
+    background = cv2.medianBlur(gray, blur_k)
+    white_bg = (background >= 214).astype(np.uint8) * 255
+    # Raw luma protects product labels and dark components while still allowing
+    # gray anti-aliased watermark pixels on white to be covered.
+    not_dark_product = (gray >= 120).astype(np.uint8) * 255
+    white_target = cv2.bitwise_and(text_line, white_bg)
+    white_target = cv2.bitwise_and(white_target, not_dark_product)
+
+    safe_full_line = det.roi_class in {"plain_white", "near_white", "low_texture_background"}
+    if not safe_full_line:
+        white_target = cv2.bitwise_and(white_target, cv2.dilate(glyph_halo, np.ones((3, 7), np.uint8), iterations=1))
+
+    target = white_target
+    target_kind = "white_text_line"
+    ring_source_mask = text_line if np.count_nonzero(white_target) >= 8 else glyph_halo
+
+    if np.count_nonzero(target) < 8 and det.roi_class in {
+        "low_texture_background",
+        "simple_product_surface",
+        "dark_product_surface",
+        "plain_white",
+        "near_white",
+    }:
+        pad_x = max(18, int(round(b["w"] * 0.22)))
+        pad_y = max(14, int(round(b["h"] * 1.15)))
+        ring = _context_ring(gray.shape, b, glyph_halo, pad_x, pad_y)
+        ring_pixels = img[ring > 0].reshape(-1, 3)
+        ring_gray = gray[ring > 0]
+        edge_density = float(np.mean(cv2.Canny(gray, 55, 150)[ring > 0] > 0)) if ring_gray.size else 1.0
+        color_std = float(np.mean(np.std(ring_pixels, axis=0))) if ring_pixels.size else 255.0
+        if ring_pixels.size >= 36 and edge_density <= (0.080 if risky else 0.115) and color_std <= (24.0 if risky else 34.0):
+            target = cv2.bitwise_and(glyph_halo, text_line)
+            target_kind = "solid_glyph_halo"
+            ring_source_mask = glyph_halo
+
+    area = float(np.count_nonzero(target)) / max(1, target.size)
+    area_limit = 0.014 if risky else 0.034
+    if target_kind == "white_text_line":
+        # A confirmed OCR/template text-line cover on white background is
+        # naturally wider than the tight glyph mask. Allow that expansion
+        # relative to the original mask while keeping an absolute cap.
+        base_area = _mask_area(mask)
+        area_limit = max(area_limit, min(0.026 if risky else 0.034, base_area * 1.65 + 0.002))
+    if area <= 0.0 or area > area_limit:
+        return None, target, area, {
+            "reason": "solid_cover_area_limit" if area > area_limit else "no_solid_background_target",
+            "target_area_pct": area * 100,
+            "area_limit_pct": area_limit * 100,
+            "target_kind": target_kind,
+        }
+
+    pad_x = max(20, int(round(b["w"] * 0.28)))
+    pad_y = max(12, int(round(b["h"] * 0.85)))
+    context = _context_ring(gray.shape, b, ring_source_mask, pad_x, pad_y)
+    if target_kind == "white_text_line":
+        context = cv2.bitwise_and(context, ((background >= 214).astype(np.uint8) * 255))
+        context = cv2.bitwise_and(context, ((gray >= 170).astype(np.uint8) * 255))
+    if np.count_nonzero(context) < 20:
+        context = _context_ring(gray.shape, b, target, pad_x, pad_y)
+    context_pixels = img[context > 0].reshape(-1, 3)
+    if context_pixels.size == 0:
+        return None, target, area, {"reason": "insufficient_solid_context", "target_kind": target_kind}
+
+    global_fill = np.median(context_pixels, axis=0).astype(np.float32)
+    noise_sigma = np.clip(np.std(context_pixels, axis=0), 0.0, 1.2 if target_kind == "white_text_line" else 2.2)
+    fill_img = img.astype(np.float32).copy()
+    ys, xs = np.where(target > 0)
+    for y in range(int(ys.min()), int(ys.max()) + 1):
+        cols = np.where(target[y, :] > 0)[0]
+        if not len(cols):
+            continue
+        row1 = max(0, y - 2)
+        row2 = min(img_h, y + 3)
+        row_context = context[row1:row2, :]
+        row_pixels = img[row1:row2, :][row_context > 0]
+        row_fill = np.median(row_pixels.reshape(-1, 3), axis=0).astype(np.float32) if row_pixels.size >= 18 else global_fill
+        pseudo = (((cols * 13 + y * 29 + b["x"] * 5) % 19) - 9).astype(np.float32)[:, None] / 9.0
+        fill_img[y, cols] = row_fill.reshape(1, 3) + pseudo * noise_sigma.reshape(1, 3)
+
+    repaired = img.copy()
+    repaired[target > 0] = np.uint8(np.clip(fill_img[target > 0], 0, 255))
+    return repaired, target, area, {
+        "operator": "solid_background_direct_cover",
+        "solid_background_cover_used": True,
+        "solid_cover_target": target_kind,
+        "solid_cover_context_pixels": int(np.count_nonzero(context)),
+        "solid_cover_area_pct": area * 100,
+    }
+
+
 def evaluate_cleaned_output(
     original: np.ndarray,
     candidate: np.ndarray,
@@ -3041,6 +3173,40 @@ def clean_image(
         area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
         if area > area_limit:
             continue
+        cover_candidate, cover_mask, cover_area, cover_meta = solid_background_direct_cover_repair(
+            img,
+            gray,
+            mask,
+            det,
+            risky=risky_product_roi,
+        )
+        if cover_candidate is not None and cover_mask is not None:
+            cgray = cv2.cvtColor(cover_candidate, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, cover_mask) / max(laplacian_var(gray, cover_mask), 1e-6)
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(cover_candidate)
+            cost = (
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.25
+                + alpha_probe * 0.80
+                + cover_area * (5.0 if not risky_product_roi else 7.0)
+                + max(0.0, 0.12 - sharpness_ratio) * 0.25
+                - (0.16 if cover_meta.get("solid_cover_target") == "white_text_line" else 0.08)
+            )
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                cover_area,
+                f"{variant}_solid_background_cover",
+                cover_candidate,
+                cover_mask,
+                metrics,
+                {"alpha_residual_probe_score": alpha_probe, **cover_meta},
+            ))
         near_candidate, near_mask, near_area, bg_fraction = near_area_background_fill_repair(
             img,
             gray,
@@ -3488,6 +3654,10 @@ def clean_image(
         "alpha_template_residual_after": round(float(alpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
         "alpha_residual_reduction": round(float(alpha_metrics.get("alpha_residual_reduction") or 0.0), 4),
         "thin_residual_inpaint": bool(selected_extra.get("thin_residual_inpaint")),
+        "solid_background_cover_used": bool(selected_extra.get("solid_background_cover_used")),
+        "solid_cover_target": selected_extra.get("solid_cover_target", ""),
+        "solid_cover_area_pct": round(float(selected_extra.get("solid_cover_area_pct") or 0.0), 3),
+        "solid_cover_context_pixels": int(selected_extra.get("solid_cover_context_pixels") or 0),
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
         meta.update({
@@ -3631,6 +3801,11 @@ def clean_all_detections(
         for item in details
         if item.get("roi_repair_operator")
     ]
+    solid_cover_targets = [
+        str(item.get("solid_cover_target"))
+        for item in details
+        if item.get("solid_cover_target")
+    ]
     sunsky_check_passes = [
         bool(item["sunsky_check_pass"])
         for item in details
@@ -3679,6 +3854,27 @@ def clean_all_detections(
         "alpha_template_residual_after": round(max(alpha_after_scores), 4) if alpha_after_scores else 0.0,
         "alpha_residual_reduction": round(max(alpha_reductions), 4) if alpha_reductions else 0.0,
         "thin_residual_inpaint": any(bool(item.get("thin_residual_inpaint")) for item in details),
+        "solid_background_cover_used": any(bool(item.get("solid_background_cover_used")) for item in details),
+        "solid_cover_target": ",".join(dict.fromkeys(solid_cover_targets)),
+        "solid_cover_area_pct": round(
+            max(
+                [
+                    float(item.get("solid_cover_area_pct") or 0.0)
+                    for item in details
+                    if isinstance(item.get("solid_cover_area_pct"), (int, float))
+                ],
+                default=0.0,
+            ),
+            3,
+        ),
+        "solid_cover_context_pixels": max(
+            [
+                int(item.get("solid_cover_context_pixels") or 0)
+                for item in details
+                if isinstance(item.get("solid_cover_context_pixels"), int)
+            ],
+            default=0,
+        ),
         "candidate_count": sum(repair_candidate_counts) if repair_candidate_counts else 0,
         "best_candidate_id": next((str(item.get("best_candidate_id")) for item in details if item.get("best_candidate_id")), ""),
         "first_pass_reason": ";".join(dict.fromkeys(first_pass_reasons)),

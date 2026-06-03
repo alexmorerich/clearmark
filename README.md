@@ -46,6 +46,7 @@ inventory images
    -> residual-only cleanup
       -> residual evidence mask
       -> row/ring fill, thin inpaint, and ROI-specific repair candidates
+   -> solid-background direct cover for confirmed marks on pure color areas
 -> run the strict final publish gate
 -> write cleaned/ only for gate-passed outputs
 -> write attempts/ for failed best attempts
@@ -201,6 +202,12 @@ For `plain_white`, `near_white`, and `low_texture_background`, ClearMark can use
 
 This avoids gray halos and avoids broad white rectangles.
 
+### Solid Background Direct Cover
+
+For confirmed Sunsky text on pure white or other low-texture solid color areas, ClearMark now generates a direct background-cover candidate. Instead of asking inpaint to infer the background from narrow glyph strokes, it expands to the OCR/template-supported text line, verifies that the target pixels sit on a plain background, and writes the local row/background median color directly over the watermark footprint.
+
+This strategy is intended for the exact residual pattern where faint `sunsky-online.com` glyphs remain on a plain white or solid surface. It does not bypass safety review: if the expanded cover touches product text, cable edges, connector details, or creates a visible band, the final gate keeps the image in `needs_manual`.
+
 ### Dark Surface Scrub
 
 For `dark_product_surface`, ClearMark avoids pale fills. It samples nearby dark pixels, scrubs only low-alpha watermark residue, and preserves strong product edges.
@@ -305,6 +312,10 @@ Each processed image records diagnostic fields such as:
   "alpha_best_gain": 1.0,
   "alpha_best_logo_bgr": [180, 180, 180],
   "thin_residual_inpaint": true,
+  "solid_background_cover_used": false,
+  "solid_cover_target": "",
+  "solid_cover_area_pct": 0.0,
+  "solid_cover_context_pixels": 0,
   "candidate_count": 0,
   "best_candidate_id": "",
   "first_pass_reason": "",

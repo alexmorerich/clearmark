@@ -285,3 +285,45 @@ def test_residual_second_pass_uses_roi_specific_repairs(monkeypatch) -> None:
     assert meta["cleanup_strategy"] == "dark_surface_low_alpha_scrub"
     assert meta["roi_repair_operator"] == "dark_surface_low_alpha_scrub"
     assert meta["dark_surface_scrub_used"] is True
+
+
+def test_solid_background_direct_cover_expands_beyond_tight_mask() -> None:
+    image = np.full((320, 640, 3), 248, np.uint8)
+    cv2.putText(image, "sunsky-online.com", (212, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (178, 178, 178), 1, cv2.LINE_AA)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=204,
+        y=146,
+        w=170,
+        h=28,
+        score=0.92,
+        verify_score=0.91,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 204, "y": 146, "w": 170, "h": 28},
+        mask_area_pct=0.5,
+        text_score=0.92,
+        text_components=12,
+        contrast_span=22.0,
+        line_dominance=0.15,
+        confidence=0.94,
+        roi_class="plain_white",
+    )
+    tight_mask = np.zeros(gray.shape, np.uint8)
+    tight_mask[156:164, 264:292] = 255
+
+    repaired, cover_mask, area, meta = pipeline.solid_background_direct_cover_repair(
+        image,
+        gray,
+        tight_mask,
+        det,
+        risky=False,
+    )
+
+    assert repaired is not None
+    assert cover_mask is not None
+    assert meta["solid_background_cover_used"] is True
+    assert meta["solid_cover_target"] == "white_text_line"
+    assert area > pipeline._mask_area(tight_mask)
+    assert int(np.median(repaired[150:172, 212:366])) >= 245
+    assert int(np.min(repaired[157:164, 212:366])) >= 242
