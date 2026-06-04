@@ -567,7 +567,7 @@ def project_mark_box(raw: dict, template: TemplateSpec, img_w: int, img_h: int) 
     return clamp_box(x - pad_x, y - pad_y, mark_w, mark_h, img_w, img_h)
 
 
-def text_likeness(gray: np.ndarray, box: dict) -> tuple[float, int]:
+def text_likeness(gray: np.ndarray, box: dict, *, suppress_frame_edges: bool = False) -> tuple[float, int]:
     """Score whether a box looks like many small text glyphs, not a frame edge.
 
     This is deliberately cheap and conservative. It helps demote false positives
@@ -599,6 +599,8 @@ def text_likeness(gray: np.ndarray, box: dict) -> tuple[float, int]:
             continue
         if ww > roi.shape[1] * 0.45:
             continue
+        if suppress_frame_edges and hh >= 5 and hh > ww * 2.4:
+            continue
         components.append((xx, yy, ww, hh, area))
 
     if components:
@@ -609,12 +611,17 @@ def text_likeness(gray: np.ndarray, box: dict) -> tuple[float, int]:
     else:
         coverage = 0.0
     density = sum(area for *_, area in components) / max(roi.size, 1)
+    reported_components = len(components)
     score = (
-        min(1.0, len(components) / 18.0) * 0.45
+        min(1.0, reported_components / 18.0) * 0.45
         + min(1.0, coverage) * 0.35
         + min(1.0, density * 20.0) * 0.20
     )
-    return float(score), len(components)
+    if suppress_frame_edges and coverage < 0.12:
+        span_factor = coverage / 0.12
+        score *= span_factor
+        reported_components = min(reported_components, 1)
+    return float(score), reported_components
 
 
 def band_features(gray: np.ndarray, box: dict) -> dict:
@@ -1815,7 +1822,7 @@ def residual_quality_metrics(
     templates: list[TemplateSpec] | None = None,
 ) -> dict:
     template_residual = residual_score(gray, det, templates)
-    post_text_score, post_text_components = text_likeness(gray, det.mark_box)
+    post_text_score, post_text_components = text_likeness(gray, det.mark_box, suppress_frame_edges=True)
     features = band_features(gray, det.mark_box)
     visible_residual = residual_visibility_score(
         template_residual,
@@ -1874,6 +1881,8 @@ def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
             continue
         if ww > roi.shape[1] * 0.30:
             continue
+        if hh >= 5 and hh > ww * 2.4:
+            continue
         components += 1
         total_area += int(area)
         xs.extend([xx, xx + ww])
@@ -1887,7 +1896,7 @@ def residual_component_metrics(gray: np.ndarray, det: Detection) -> dict:
         + min(1.0, area_ratio / 0.08) * 0.20
     )
     fail = (
-        score > DOT_CHAIN_SCORE_MAX
+        (score > DOT_CHAIN_SCORE_MAX and horizontal_span > DOT_CHAIN_SPAN_MIN * 0.70)
         or (
             components >= DOT_CHAIN_COMPONENT_COUNT
             and horizontal_span > DOT_CHAIN_SPAN_MIN
@@ -2223,6 +2232,35 @@ def _context_ring(mask_shape: tuple[int, int], mark_box: dict, mask: np.ndarray,
     return cv2.bitwise_and(window, cv2.bitwise_not(expanded))
 
 
+def _rect_mask(shape: tuple[int, int], rect: tuple[int, int, int, int]) -> np.ndarray:
+    x1, y1, x2, y2 = rect
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = 255
+    return mask
+
+
+def _rect_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _rect_context_mask(shape: tuple[int, int], rect: tuple[int, int, int, int], pad_x: int, pad_y: int) -> np.ndarray:
+    img_h, img_w = shape[:2]
+    x1, y1, x2, y2 = rect
+    window = np.zeros(shape, dtype=np.uint8)
+    wx1 = max(0, x1 - pad_x)
+    wy1 = max(0, y1 - pad_y)
+    wx2 = min(img_w, x2 + pad_x)
+    wy2 = min(img_h, y2 + pad_y)
+    window[wy1:wy2, wx1:wx2] = 255
+    target = _rect_mask(shape, rect)
+    expanded = cv2.dilate(target, np.ones((5, 11), np.uint8), iterations=1)
+    return cv2.bitwise_and(window, cv2.bitwise_not(expanded))
+
+
 def _blend_repair(base_bgr: np.ndarray, fill_bgr: np.ndarray, mask: np.ndarray, sigma: float = 0.85) -> np.ndarray:
     alpha = cv2.GaussianBlur((mask > 0).astype(np.uint8) * 255, (0, 0), sigma).astype(np.float32)[:, :, None] / 255.0
     repaired = base_bgr.astype(np.float32) * (1.0 - alpha) + fill_bgr.astype(np.float32) * alpha
@@ -2471,6 +2509,319 @@ def roi_specific_repair_candidates(
             continue
         repaired.append((operator.__name__, image, cleanup_mask, meta))
     return repaired
+
+
+def _solid_block_candidate_rects(
+    shape: tuple[int, int],
+    target_rect: tuple[int, int, int, int],
+) -> list[tuple[int, int, int, int]]:
+    img_h, img_w = shape[:2]
+    x1, y1, x2, y2 = target_rect
+    block_w = x2 - x1
+    block_h = y2 - y1
+    if block_w <= 0 or block_h <= 0:
+        return []
+
+    gap_values = list(dict.fromkeys([
+        2,
+        max(3, block_h // 3),
+        max(4, block_h // 2),
+        block_h + 2,
+        block_h * 2 + 2,
+    ]))
+    dx_values = list(dict.fromkeys([0, -block_w // 8, block_w // 8, -block_w // 4, block_w // 4]))
+    dy_values = list(dict.fromkeys([0, -block_h // 2, block_h // 2]))
+    rects: list[tuple[int, int, int, int]] = []
+
+    def add_rect(rx1: int, ry1: int) -> None:
+        rx2 = rx1 + block_w
+        ry2 = ry1 + block_h
+        if rx1 < 0 or ry1 < 0 or rx2 > img_w or ry2 > img_h:
+            return
+        rect = (int(rx1), int(ry1), int(rx2), int(ry2))
+        if _rect_overlap(target_rect, rect) > 0:
+            return
+        if rect not in rects:
+            rects.append(rect)
+
+    for gap in gap_values:
+        for dx in dx_values:
+            add_rect(x1 + dx, y1 - gap - block_h)
+            add_rect(x1 + dx, y2 + gap)
+        for dy in dy_values:
+            add_rect(x1 - gap - block_w, y1 + dy)
+            add_rect(x2 + gap, y1 + dy)
+
+    return rects
+
+
+def _trim_rect_to_solid_strips(
+    gray: np.ndarray,
+    rect: tuple[int, int, int, int],
+    roi_class: str,
+) -> tuple[int, int, int, int]:
+    img_h, _ = gray.shape[:2]
+    x1, y1, x2, y2 = rect
+    width = x2 - x1
+    height = y2 - y1
+    if width < 48 or height < 8:
+        return rect
+
+    strip_h = max(5, min(18, height // 3))
+    gap = 2
+    strips = []
+    top_y1 = max(0, y1 - gap - strip_h)
+    top_y2 = max(0, y1 - gap)
+    bottom_y1 = min(img_h, y2 + gap)
+    bottom_y2 = min(img_h, y2 + gap + strip_h)
+    if top_y2 > top_y1:
+        strips.append(gray[top_y1:top_y2, x1:x2])
+    if bottom_y2 > bottom_y1:
+        strips.append(gray[bottom_y1:bottom_y2, x1:x2])
+    if not strips:
+        return rect
+
+    sample = np.concatenate(strips, axis=0)
+    if sample.shape[1] != width or sample.size == 0:
+        return rect
+    col_median = np.median(sample, axis=0)
+    center_slice = col_median[max(0, width // 3):min(width, width * 2 // 3)]
+    surface_luma = float(np.median(center_slice if center_slice.size else col_median))
+    if roi_class in {"plain_white", "near_white", "low_texture_background"} and surface_luma >= 180:
+        good = col_median >= max(205.0, surface_luma - 18.0)
+    elif roi_class == "dark_product_surface" or surface_luma <= 125:
+        good = col_median <= min(150.0, surface_luma + 38.0)
+    else:
+        good = np.abs(col_median - surface_luma) <= 34.0
+    if not bool(good[width // 2]):
+        runs: list[tuple[int, int]] = []
+        start = None
+        for idx, ok in enumerate(good):
+            if ok and start is None:
+                start = idx
+            elif not ok and start is not None:
+                runs.append((start, idx))
+                start = None
+        if start is not None:
+            runs.append((start, width))
+        if not runs:
+            return rect
+        left, right = max(runs, key=lambda item: item[1] - item[0])
+    else:
+        left = width // 2
+        while left > 0 and good[left - 1]:
+            left -= 1
+        right = width // 2 + 1
+        while right < width and good[right]:
+            right += 1
+
+    edge_margin = 0 if roi_class in {"plain_white", "near_white", "low_texture_background"} and surface_luma >= 180 else 2
+    left = max(0, left - edge_margin)
+    right = min(width, right + edge_margin)
+    trimmed_width = right - left
+    if trimmed_width < max(40, width * 0.48):
+        return rect
+    return x1 + int(left), y1, x1 + int(right), y2
+
+
+def solid_background_block_cover_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    mask: np.ndarray,
+    det: Detection,
+    *,
+    risky: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Cover a confirmed watermark line with the nearest same-size solid block.
+
+    This is for monochrome panels and smooth color planes where the cleanest
+    repair is copying an adjacent patch of the same size and color. The
+    candidate is still checked by the unchanged final publish gate.
+    """
+    if mask is None or np.count_nonzero(mask) == 0:
+        return None, None, 0.0, {"reason": "empty_mask"}
+    if det.roi_class == "text_or_label_area":
+        return None, None, 0.0, {"reason": "text_label_area_block_cover_disabled"}
+
+    confirmed_text_line = (
+        (
+            det.template.startswith("ocr:")
+            and det.ocr_watermark_score >= OCR_CROP_LOCALIZE_MIN
+        )
+        or det.confidence >= 0.92
+    )
+    if not confirmed_text_line:
+        return None, None, 0.0, {"reason": "unconfirmed_text_line"}
+
+    allowed_classes = {
+        "plain_white",
+        "near_white",
+        "low_texture_background",
+        "simple_product_surface",
+        "dark_product_surface",
+    }
+    if det.roi_class not in allowed_classes:
+        return None, None, 0.0, {"reason": f"roi_not_solid_block:{det.roi_class or 'unknown'}"}
+
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    glyph_halo = create_glyph_halo_mask(
+        canonical_ink_mask(),
+        b,
+        6 if not risky else 4,
+        2 if not risky else 1,
+        gray.shape[:2],
+    )
+    seed = cv2.bitwise_or((mask > 0).astype(np.uint8) * 255, glyph_halo)
+    ys, xs = np.where(seed > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None, None, 0.0, {"reason": "empty_block_seed"}
+    tail_px = int(round((int(xs.max()) - int(xs.min()) + 1) * 0.035))
+    tail_px = max(5, min(18 if risky else 24, tail_px))
+    line_pad_y = max(2, int(round((int(ys.max()) - int(ys.min()) + 1) * (0.12 if risky else 0.18))))
+    target_rect = (
+        max(0, int(xs.min()) - tail_px),
+        max(0, int(ys.min()) - line_pad_y),
+        min(img_w, int(xs.max()) + 1 + tail_px),
+        min(img_h, int(ys.max()) + 1 + line_pad_y),
+    )
+    target_rect = _trim_rect_to_solid_strips(gray, target_rect, det.roi_class)
+    target_w = target_rect[2] - target_rect[0]
+    target_h = target_rect[3] - target_rect[1]
+    if target_w < 32 or target_h < 6:
+        return None, None, 0.0, {"reason": "target_rect_too_small"}
+
+    target_mask = _rect_mask(gray.shape, target_rect)
+    area = _mask_area(target_mask)
+    area_limit = 0.070 if det.roi_class in {"plain_white", "near_white", "low_texture_background"} else 0.046
+    if risky:
+        area_limit = min(area_limit, 0.040)
+    if area <= 0.0 or area > area_limit:
+        return None, target_mask, area, {
+            "reason": "solid_block_area_limit",
+            "target_area_pct": area * 100,
+            "area_limit_pct": area_limit * 100,
+        }
+
+    strip_h = max(5, min(18, target_h // 3))
+    gap = 2
+    context = np.zeros_like(gray, dtype=np.uint8)
+    x1, y1, x2, y2 = target_rect
+    top_y1 = max(0, y1 - gap - strip_h)
+    top_y2 = max(0, y1 - gap)
+    bottom_y1 = min(img_h, y2 + gap)
+    bottom_y2 = min(img_h, y2 + gap + strip_h)
+    if top_y2 > top_y1:
+        context[top_y1:top_y2, x1:x2] = 255
+    if bottom_y2 > bottom_y1:
+        context[bottom_y1:bottom_y2, x1:x2] = 255
+    if np.count_nonzero(context) < 60:
+        pad_x = max(18, int(round(target_w * 0.12)))
+        pad_y = max(10, int(round(target_h * 1.05)))
+        context = _rect_context_mask(gray.shape, target_rect, pad_x, pad_y)
+    context_pixels = img[context > 0].reshape(-1, 3)
+    context_gray = gray[context > 0]
+    if context_pixels.size < 60 or context_gray.size < 60:
+        return None, target_mask, area, {"reason": "insufficient_block_context"}
+
+    context_std = float(np.mean(np.std(context_pixels, axis=0)))
+    context_luma_std = float(np.std(context_gray))
+    context_edges = cv2.Canny(gray, 55, 150)
+    context_edge_density = float(np.mean(context_edges[context > 0] > 0))
+    context_median = np.median(context_pixels, axis=0).astype(np.float32)
+    bright_surface = det.roi_class in {"plain_white", "near_white", "low_texture_background"}
+    context_std_limit = 24.0 if bright_surface else 18.0
+    context_edge_limit = 0.055 if bright_surface else 0.032
+    if risky:
+        context_std_limit = min(context_std_limit, 14.0)
+        context_edge_limit = min(context_edge_limit, 0.024)
+    if context_std > context_std_limit or context_luma_std > context_std_limit * 1.25 or context_edge_density > context_edge_limit:
+        return None, target_mask, area, {
+            "reason": "context_not_solid_enough",
+            "solid_block_context_std": context_std,
+            "solid_block_context_luma_std": context_luma_std,
+            "solid_block_context_edge_density": context_edge_density,
+        }
+
+    best: tuple[float, tuple[int, int, int, int], np.ndarray, dict] | None = None
+    block_std_limit = 18.0 if bright_surface else 13.0
+    block_edge_limit = 0.040 if bright_surface else 0.022
+    if risky:
+        block_std_limit = min(block_std_limit, 10.5)
+        block_edge_limit = min(block_edge_limit, 0.018)
+    median_delta_limit = 18.0 if bright_surface else 12.0
+    if risky:
+        median_delta_limit = min(median_delta_limit, 10.0)
+
+    target_cx = (target_rect[0] + target_rect[2]) / 2.0
+    target_cy = (target_rect[1] + target_rect[3]) / 2.0
+    for donor_rect in _solid_block_candidate_rects(gray.shape, target_rect):
+        dx1, dy1, dx2, dy2 = donor_rect
+        donor = img[dy1:dy2, dx1:dx2]
+        donor_gray = gray[dy1:dy2, dx1:dx2]
+        if donor.shape[:2] != (target_h, target_w) or donor.size == 0:
+            continue
+        donor_pixels = donor.reshape(-1, 3)
+        donor_std = float(np.mean(np.std(donor_pixels, axis=0)))
+        donor_luma_std = float(np.std(donor_gray))
+        donor_edge_density = float(np.mean(cv2.Canny(donor_gray, 55, 150) > 0))
+        donor_median = np.median(donor_pixels, axis=0).astype(np.float32)
+        median_delta = float(np.linalg.norm(donor_median - context_median) / math.sqrt(3.0))
+        if donor_std > block_std_limit or donor_luma_std > block_std_limit * 1.25:
+            continue
+        if donor_edge_density > block_edge_limit or median_delta > median_delta_limit:
+            continue
+        donor_cx = (dx1 + dx2) / 2.0
+        donor_cy = (dy1 + dy2) / 2.0
+        distance = float(math.hypot(donor_cx - target_cx, donor_cy - target_cy))
+        score = (
+            distance / max(1.0, max(target_w, target_h))
+            + donor_std * 0.035
+            + donor_luma_std * 0.018
+            + donor_edge_density * 18.0
+            + median_delta * 0.045
+        )
+        details = {
+            "solid_block_donor_box": {"x": dx1, "y": dy1, "w": target_w, "h": target_h},
+            "solid_block_distance_px": distance,
+            "solid_block_color_std": donor_std,
+            "solid_block_luma_std": donor_luma_std,
+            "solid_block_edge_density": donor_edge_density,
+            "solid_block_median_delta": median_delta,
+            "solid_block_context_std": context_std,
+            "solid_block_context_edge_density": context_edge_density,
+        }
+        if best is None or score < best[0]:
+            best = (score, donor_rect, donor.copy(), details)
+
+    if best is None:
+        return None, target_mask, area, {
+            "reason": "no_matching_same_size_solid_block",
+            "solid_block_context_std": context_std,
+            "solid_block_context_edge_density": context_edge_density,
+        }
+
+    _, donor_rect, donor, details = best
+    x1, y1, x2, y2 = target_rect
+    pasted = img.copy()
+    pasted[y1:y2, x1:x2] = donor
+    alpha = cv2.GaussianBlur(target_mask, (0, 0), 0.85).astype(np.float32)[:, :, None] / 255.0
+    alpha[target_mask == 0] = 0.0
+    repaired = img.astype(np.float32) * (1.0 - alpha) + pasted.astype(np.float32) * alpha
+    repaired = np.uint8(np.clip(repaired, 0, 255))
+    return repaired, target_mask, area, {
+        "operator": "solid_background_block_cover",
+        "solid_background_cover_used": True,
+        "solid_block_cover_used": True,
+        "solid_block_boundary_feather": True,
+        "solid_cover_target": "nearest_same_size_block",
+        "solid_cover_context_pixels": int(np.count_nonzero(context)),
+        "solid_cover_area_pct": area * 100,
+        "solid_cover_background_source": "nearest_same_size_block",
+        "solid_block_target_box": {"x": x1, "y": y1, "w": target_w, "h": target_h},
+        **details,
+        "solid_block_donor_rect": donor_rect,
+    }
 
 
 def near_area_background_fill_repair(
@@ -3206,6 +3557,44 @@ def clean_image(
         area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
         if area > area_limit:
             continue
+        block_candidate, block_mask, block_area, block_meta = solid_background_block_cover_repair(
+            img,
+            gray,
+            mask,
+            det,
+            risky=risky_product_roi,
+        )
+        if block_candidate is not None and block_mask is not None:
+            cgray = cv2.cvtColor(block_candidate, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, block_mask) / max(laplacian_var(gray, block_mask), 1e-6)
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(block_candidate)
+            block_texture = float(block_meta.get("solid_block_color_std") or 0.0)
+            block_edges = float(block_meta.get("solid_block_edge_density") or 0.0)
+            cost = (
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.20
+                + alpha_probe * 0.70
+                + block_area * (3.2 if not risky_product_roi else 5.0)
+                + block_texture * 0.002
+                + block_edges * 0.65
+                + max(0.0, 0.12 - sharpness_ratio) * 0.22
+                - 0.22
+            )
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                block_area,
+                f"{variant}_solid_block_cover",
+                block_candidate,
+                block_mask,
+                metrics,
+                {"alpha_residual_probe_score": alpha_probe, **block_meta},
+            ))
         cover_candidate, cover_mask, cover_area, cover_meta = solid_background_direct_cover_repair(
             img,
             gray,
@@ -3688,9 +4077,16 @@ def clean_image(
         "alpha_residual_reduction": round(float(alpha_metrics.get("alpha_residual_reduction") or 0.0), 4),
         "thin_residual_inpaint": bool(selected_extra.get("thin_residual_inpaint")),
         "solid_background_cover_used": bool(selected_extra.get("solid_background_cover_used")),
+        "solid_block_cover_used": bool(selected_extra.get("solid_block_cover_used")),
         "solid_cover_target": selected_extra.get("solid_cover_target", ""),
         "solid_cover_area_pct": round(float(selected_extra.get("solid_cover_area_pct") or 0.0), 3),
         "solid_cover_context_pixels": int(selected_extra.get("solid_cover_context_pixels") or 0),
+        "solid_cover_background_source": selected_extra.get("solid_cover_background_source", ""),
+        "solid_block_target_box": selected_extra.get("solid_block_target_box") or {},
+        "solid_block_donor_box": selected_extra.get("solid_block_donor_box") or {},
+        "solid_block_color_std": round(float(selected_extra.get("solid_block_color_std") or 0.0), 4),
+        "solid_block_edge_density": round(float(selected_extra.get("solid_block_edge_density") or 0.0), 4),
+        "solid_block_median_delta": round(float(selected_extra.get("solid_block_median_delta") or 0.0), 4),
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
         meta.update({
@@ -3888,6 +4284,7 @@ def clean_all_detections(
         "alpha_residual_reduction": round(max(alpha_reductions), 4) if alpha_reductions else 0.0,
         "thin_residual_inpaint": any(bool(item.get("thin_residual_inpaint")) for item in details),
         "solid_background_cover_used": any(bool(item.get("solid_background_cover_used")) for item in details),
+        "solid_block_cover_used": any(bool(item.get("solid_block_cover_used")) for item in details),
         "solid_cover_target": ",".join(dict.fromkeys(solid_cover_targets)),
         "solid_cover_area_pct": round(
             max(
@@ -3907,6 +4304,23 @@ def clean_all_detections(
                 if isinstance(item.get("solid_cover_context_pixels"), int)
             ],
             default=0,
+        ),
+        "solid_cover_background_source": next(
+            (str(item.get("solid_cover_background_source")) for item in details if item.get("solid_cover_background_source")),
+            "",
+        ),
+        "solid_block_target_box": next((item.get("solid_block_target_box") for item in details if item.get("solid_block_target_box")), {}),
+        "solid_block_donor_box": next((item.get("solid_block_donor_box") for item in details if item.get("solid_block_donor_box")), {}),
+        "solid_block_color_std": round(
+            max(
+                [
+                    float(item.get("solid_block_color_std") or 0.0)
+                    for item in details
+                    if isinstance(item.get("solid_block_color_std"), (int, float))
+                ],
+                default=0.0,
+            ),
+            4,
         ),
         "candidate_count": sum(repair_candidate_counts) if repair_candidate_counts else 0,
         "best_candidate_id": next((str(item.get("best_candidate_id")) for item in details if item.get("best_candidate_id")), ""),

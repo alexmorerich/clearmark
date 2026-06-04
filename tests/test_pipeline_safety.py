@@ -329,6 +329,102 @@ def test_solid_background_direct_cover_expands_beyond_tight_mask() -> None:
     assert int(np.min(repaired[157:164, 212:366])) >= 242
 
 
+def test_solid_background_block_cover_copies_nearest_same_size_patch() -> None:
+    image = np.full((340, 680, 3), 248, np.uint8)
+    for y in range(image.shape[0]):
+        image[y, :, :] = 246 + (y % 5)
+    cv2.putText(image, "sunsky-online.com", (236, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (178, 178, 178), 1, cv2.LINE_AA)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=220,
+        y=154,
+        w=218,
+        h=34,
+        score=0.93,
+        verify_score=0.92,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 220, "y": 154, "w": 218, "h": 34},
+        mask_area_pct=0.5,
+        text_score=0.93,
+        text_components=14,
+        contrast_span=24.0,
+        line_dominance=0.16,
+        confidence=0.95,
+        ocr_watermark_score=0.93,
+        roi_class="near_white",
+    )
+    tight_mask = np.zeros(gray.shape, np.uint8)
+    tight_mask[166:176, 292:326] = 255
+
+    repaired, cover_mask, area, meta = pipeline.solid_background_block_cover_repair(
+        image,
+        gray,
+        tight_mask,
+        det,
+        risky=False,
+    )
+
+    assert repaired is not None
+    assert cover_mask is not None
+    assert meta["solid_block_cover_used"] is True
+    assert meta["solid_cover_target"] == "nearest_same_size_block"
+    assert area > pipeline._mask_area(tight_mask)
+    target = meta["solid_block_target_box"]
+    donor = meta["solid_block_donor_box"]
+    assert target["w"] == donor["w"]
+    assert target["h"] == donor["h"]
+    target_patch = repaired[target["y"]:target["y"] + target["h"], target["x"]:target["x"] + target["w"]]
+    donor_patch = image[donor["y"]:donor["y"] + donor["h"], donor["x"]:donor["x"] + donor["w"]]
+    center = target_patch[3:-3, 3:-3]
+    donor_center = donor_patch[3:-3, 3:-3]
+    assert np.array_equal(center, donor_center)
+    outside = cv2.bitwise_not(cover_mask)
+    assert int(np.count_nonzero(cv2.cvtColor(cv2.absdiff(image, repaired), cv2.COLOR_BGR2GRAY)[outside > 0])) == 0
+    assert int(np.min(target_patch)) >= 246
+
+
+def test_solid_background_block_cover_skips_product_label_area() -> None:
+    image = np.full((220, 460, 3), 248, np.uint8)
+    cv2.putText(image, "Battery", (175, 96), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (20, 20, 20), 2, cv2.LINE_AA)
+    cv2.putText(image, "sunsky-online.com", (154, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (178, 178, 178), 1, cv2.LINE_AA)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=142,
+        y=102,
+        w=180,
+        h=28,
+        score=0.91,
+        verify_score=0.90,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 142, "y": 102, "w": 180, "h": 28},
+        mask_area_pct=0.6,
+        text_score=0.92,
+        text_components=20,
+        contrast_span=170.0,
+        line_dominance=0.22,
+        confidence=0.95,
+        ocr_watermark_score=0.94,
+        roi_class="text_or_label_area",
+    )
+    tight_mask = np.zeros(gray.shape, np.uint8)
+    tight_mask[112:118, 208:250] = 255
+
+    repaired, cover_mask, area, meta = pipeline.solid_background_block_cover_repair(
+        image,
+        gray,
+        tight_mask,
+        det,
+        risky=True,
+    )
+
+    assert repaired is None
+    assert cover_mask is None
+    assert area == 0.0
+    assert meta["reason"] == "text_label_area_block_cover_disabled"
+
+
 def test_solid_background_direct_cover_handles_dark_solid_surface() -> None:
     image = np.full((320, 640, 3), 248, np.uint8)
     cv2.rectangle(image, (80, 128), (520, 230), (42, 42, 42), -1)

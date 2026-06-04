@@ -208,6 +208,24 @@ For confirmed Sunsky text on pure white, dark solid product surfaces, or other l
 
 This strategy is intended for the exact residual pattern where faint `sunsky-online.com` glyphs remain on a plain white, black, gray, or colored solid surface. It does not bypass safety review: if the expanded cover touches product text, cable edges, connector details, or creates a visible band, the final gate keeps the image in `needs_manual`.
 
+### Nearest Same-Size Solid Block Cover
+
+For monochrome LCD panels, white product cards, smooth adhesive sheets, and other genuinely single-color backgrounds, ClearMark also generates a stronger rectangular cover candidate. It builds an OCR/template-confirmed text-line rectangle, trims that rectangle back to the same-color surface, searches the nearest above, below, left, and right positions for a same-size clean color block, and copies that block over the watermark line. The center of the mark is replaced directly; the block boundary is feathered only inside the confirmed rectangle so hard seams do not become false residual components.
+
+This is only allowed when both the local context and the donor block are low-texture, low-edge, and color-consistent. It is disabled for `text_or_label_area` and rejected when the surrounding pixels look like cables, connector detail, product contours, or mixed surfaces. Manifest fields identify the decision:
+
+```json
+{
+  "solid_block_cover_used": true,
+  "solid_cover_target": "nearest_same_size_block",
+  "solid_cover_background_source": "nearest_same_size_block",
+  "solid_block_target_box": {"x": 0, "y": 0, "w": 0, "h": 0},
+  "solid_block_donor_box": {"x": 0, "y": 0, "w": 0, "h": 0}
+}
+```
+
+The final OCR, detector, residual, dot-chain, product-damage, and visible-band gates are unchanged. A copied block can become `cleaned/` only when those independent checks agree that no readable Sunsky mark or visible patch remains.
+
 ### Dark Surface Scrub
 
 For `dark_product_surface`, ClearMark avoids pale fills. It samples nearby dark pixels, scrubs only low-alpha watermark residue, and preserves strong product edges.
