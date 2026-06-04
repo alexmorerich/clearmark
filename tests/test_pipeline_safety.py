@@ -323,7 +323,52 @@ def test_solid_background_direct_cover_expands_beyond_tight_mask() -> None:
     assert repaired is not None
     assert cover_mask is not None
     assert meta["solid_background_cover_used"] is True
-    assert meta["solid_cover_target"] == "white_text_line"
+    assert meta["solid_cover_target"] == "confirmed_text_line"
     assert area > pipeline._mask_area(tight_mask)
     assert int(np.median(repaired[150:172, 212:366])) >= 245
     assert int(np.min(repaired[157:164, 212:366])) >= 242
+
+
+def test_solid_background_direct_cover_handles_dark_solid_surface() -> None:
+    image = np.full((320, 640, 3), 248, np.uint8)
+    cv2.rectangle(image, (80, 128), (520, 230), (42, 42, 42), -1)
+    cv2.putText(image, "sunsky-online.com", (188, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 150, 150), 1, cv2.LINE_AA)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=170,
+        y=160,
+        w=230,
+        h=34,
+        score=0.93,
+        verify_score=0.92,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 170, "y": 160, "w": 230, "h": 34},
+        mask_area_pct=0.7,
+        text_score=0.93,
+        text_components=14,
+        contrast_span=44.0,
+        line_dominance=0.18,
+        confidence=0.95,
+        ocr_watermark_score=0.93,
+        roi_class="dark_product_surface",
+        product_overlap=0.70,
+    )
+    tight_mask = np.zeros(gray.shape, np.uint8)
+    tight_mask[174:184, 260:298] = 255
+
+    repaired, cover_mask, area, meta = pipeline.solid_background_direct_cover_repair(
+        image,
+        gray,
+        tight_mask,
+        det,
+        risky=True,
+    )
+
+    assert repaired is not None
+    assert cover_mask is not None
+    assert meta["solid_cover_target"] == "confirmed_text_line"
+    assert area > pipeline._mask_area(tight_mask)
+    changed = cv2.absdiff(image, repaired)
+    assert int(np.count_nonzero(cv2.cvtColor(changed, cv2.COLOR_BGR2GRAY)[cover_mask > 0])) > 0
+    assert int(np.median(repaired[170:190, 188:390])) <= 62

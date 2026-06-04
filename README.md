@@ -204,9 +204,9 @@ This avoids gray halos and avoids broad white rectangles.
 
 ### Solid Background Direct Cover
 
-For confirmed Sunsky text on pure white or other low-texture solid color areas, ClearMark now generates a direct background-cover candidate. Instead of asking inpaint to infer the background from narrow glyph strokes, it expands to the OCR/template-supported text line, verifies that the target pixels sit on a plain background, and writes the local row/background median color directly over the watermark footprint.
+For confirmed Sunsky text on pure white, dark solid product surfaces, or other low-texture solid color areas, ClearMark generates a direct background-cover candidate. Instead of asking inpaint to infer the background from narrow glyph strokes, it expands to the OCR/template-supported glyph halo and left/right tails, then writes a local background estimate directly over that watermark footprint.
 
-This strategy is intended for the exact residual pattern where faint `sunsky-online.com` glyphs remain on a plain white or solid surface. It does not bypass safety review: if the expanded cover touches product text, cable edges, connector details, or creates a visible band, the final gate keeps the image in `needs_manual`.
+This strategy is intended for the exact residual pattern where faint `sunsky-online.com` glyphs remain on a plain white, black, gray, or colored solid surface. It does not bypass safety review: if the expanded cover touches product text, cable edges, connector details, or creates a visible band, the final gate keeps the image in `needs_manual`.
 
 ### Dark Surface Scrub
 

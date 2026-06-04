@@ -2585,31 +2585,45 @@ def solid_background_direct_cover_repair(
     glyph_halo = create_glyph_halo_mask(
         canonical_ink_mask(),
         b,
-        6 if not risky else 4,
-        2 if not risky else 1,
+        9 if not risky else 7,
+        3 if not risky else 2,
         gray.shape[:2],
     )
     glyph_halo = cv2.bitwise_or(glyph_halo, (mask > 0).astype(np.uint8) * 255)
-    tail_kernel_w = max(7, min(23, (tail_px // 2) * 2 + 1))
-    text_line = cv2.dilate(glyph_halo, cv2.getStructuringElement(cv2.MORPH_RECT, (tail_kernel_w, 3)), iterations=1)
+    tail_kernel_w = max(11, min(37, tail_px * 2 + 1))
+    line_kernel_h = 5 if risky else 7
+    text_line = cv2.dilate(
+        glyph_halo,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (tail_kernel_w, line_kernel_h)),
+        iterations=1,
+    )
     text_line = cv2.bitwise_and(text_line, line_band)
 
     blur_k = max(9, min(51, (max(5, b["h"] * 3) // 2) * 2 + 1))
     background = cv2.medianBlur(gray, blur_k)
     white_bg = (background >= 214).astype(np.uint8) * 255
-    # Raw luma protects product labels and dark components while still allowing
-    # gray anti-aliased watermark pixels on white to be covered.
-    not_dark_product = (gray >= 120).astype(np.uint8) * 255
     white_target = cv2.bitwise_and(text_line, white_bg)
-    white_target = cv2.bitwise_and(white_target, not_dark_product)
 
     safe_full_line = det.roi_class in {"plain_white", "near_white", "low_texture_background"}
     if not safe_full_line:
         white_target = cv2.bitwise_and(white_target, cv2.dilate(glyph_halo, np.ones((3, 7), np.uint8), iterations=1))
 
-    target = white_target
-    target_kind = "white_text_line"
-    ring_source_mask = text_line if np.count_nonzero(white_target) >= 8 else glyph_halo
+    confirmed_text_line = (
+        (
+            det.template.startswith("ocr:")
+            and det.ocr_watermark_score >= OCR_CROP_LOCALIZE_MIN
+        )
+        or det.confidence >= 0.92
+    )
+    full_line_allowed = confirmed_text_line and det.roi_class != "text_or_label_area"
+    if full_line_allowed:
+        target = text_line
+        target_kind = "confirmed_text_line"
+        ring_source_mask = text_line
+    else:
+        target = white_target
+        target_kind = "white_text_line"
+        ring_source_mask = text_line if np.count_nonzero(white_target) >= 8 else glyph_halo
 
     if np.count_nonzero(target) < 8 and det.roi_class in {
         "low_texture_background",
@@ -2632,12 +2646,17 @@ def solid_background_direct_cover_repair(
 
     area = float(np.count_nonzero(target)) / max(1, target.size)
     area_limit = 0.014 if risky else 0.034
-    if target_kind == "white_text_line":
+    if target_kind == "confirmed_text_line":
+        # The confirmed text-line target is still glyph-shaped, not a box.
+        # It must be allowed to outgrow very tight first-pass masks so that
+        # dark or mixed solid surfaces do not retain left/right watermark tails.
+        area_limit = max(area_limit, 0.055 if risky else 0.060)
+    elif target_kind == "white_text_line":
         # A confirmed OCR/template text-line cover on white background is
         # naturally wider than the tight glyph mask. Allow that expansion
         # relative to the original mask while keeping an absolute cap.
         base_area = _mask_area(mask)
-        area_limit = max(area_limit, min(0.026 if risky else 0.034, base_area * 1.65 + 0.002))
+        area_limit = max(area_limit, min(0.032 if risky else 0.040, base_area * 1.90 + 0.004))
     if area <= 0.0 or area > area_limit:
         return None, target, area, {
             "reason": "solid_cover_area_limit" if area > area_limit else "no_solid_background_target",
@@ -2657,6 +2676,20 @@ def solid_background_direct_cover_repair(
     context_pixels = img[context > 0].reshape(-1, 3)
     if context_pixels.size == 0:
         return None, target, area, {"reason": "insufficient_solid_context", "target_kind": target_kind}
+
+    if target_kind == "confirmed_text_line":
+        estimate_mask = cv2.dilate(target, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)), iterations=1)
+        background_estimate = cv2.inpaint(img, estimate_mask, 2 if risky else 3, cv2.INPAINT_TELEA)
+        repaired = img.copy()
+        repaired[target > 0] = background_estimate[target > 0]
+        return repaired, target, area, {
+            "operator": "solid_background_direct_cover",
+            "solid_background_cover_used": True,
+            "solid_cover_target": target_kind,
+            "solid_cover_context_pixels": int(np.count_nonzero(context)),
+            "solid_cover_area_pct": area * 100,
+            "solid_cover_background_source": "local_estimate",
+        }
 
     global_fill = np.median(context_pixels, axis=0).astype(np.float32)
     noise_sigma = np.clip(np.std(context_pixels, axis=0), 0.0, 1.2 if target_kind == "white_text_line" else 2.2)
