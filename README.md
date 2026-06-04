@@ -226,6 +226,10 @@ This is only allowed when both the local context and the donor block are low-tex
 
 The final OCR, detector, residual, dot-chain, product-damage, and visible-band gates are unchanged. A copied block can become `cleaned/` only when those independent checks agree that no readable Sunsky mark or visible patch remains.
 
+### Textured Panel Strip Clone
+
+For small metal plates and textured panels where the OCR-confirmed watermark sits on a narrow horizontal strip, ClearMark can clone a same-width texture strip from the closest matching row above or below the mark. This is used when a glyph-only mask would leave most of the logo visible, but a broad rectangular inpaint would smear the product surface. The strategy records `textured_panel_strip_clone_used`, `textured_strip_target_box`, and `textured_strip_donor_box` in the manifest. It still cannot publish unless the final gate passes.
+
 ### Dark Surface Scrub
 
 For `dark_product_surface`, ClearMark avoids pale fills. It samples nearby dark pixels, scrubs only low-alpha watermark residue, and preserves strong product edges.

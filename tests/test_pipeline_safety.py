@@ -425,6 +425,58 @@ def test_solid_background_block_cover_skips_product_label_area() -> None:
     assert meta["reason"] == "text_label_area_block_cover_disabled"
 
 
+def test_textured_panel_strip_clone_covers_full_ocr_line() -> None:
+    image = np.full((280, 520, 3), 248, np.uint8)
+    cv2.rectangle(image, (90, 110), (430, 190), (18, 22, 28), -1)
+    yy, xx = np.indices((70, 238))
+    texture = np.uint8(np.clip(190 + ((xx * 7 + yy * 13) % 33) - 16, 0, 255))
+    panel = cv2.merge([texture, texture + 1, texture + 3])
+    image[126:196, 140:378] = panel
+    cv2.putText(image, "sunsky-online.com", (156, 151), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=142,
+        y=124,
+        w=242,
+        h=52,
+        score=0.90,
+        verify_score=0.86,
+        template="ocr:crop:sunsky-online.com",
+        scale=1.0,
+        mark_box={"x": 142, "y": 124, "w": 242, "h": 52},
+        mask_area_pct=1.2,
+        text_score=0.95,
+        text_components=40,
+        contrast_span=180.0,
+        line_dominance=0.40,
+        confidence=0.96,
+        ocr_watermark_score=0.92,
+        roi_class="text_or_label_area",
+        product_overlap=0.70,
+    )
+    mask, _ = pipeline.create_mask(gray, det, img=image, pad_x=8, pad_y=5, dilate_px=2, glyph=True)
+
+    repaired, strip_mask, area, meta = pipeline.textured_panel_strip_clone_repair(
+        image,
+        gray,
+        mask,
+        det,
+        risky=True,
+    )
+
+    assert repaired is not None
+    assert strip_mask is not None
+    assert meta["textured_panel_strip_clone_used"] is True
+    assert area > pipeline._mask_area(mask) * 0.35
+    target = meta["textured_strip_target_box"]
+    donor = meta["textured_strip_donor_box"]
+    assert target["w"] == donor["w"]
+    assert target["h"] == donor["h"]
+    assert target["w"] >= 180
+    changed = cv2.cvtColor(cv2.absdiff(image, repaired), cv2.COLOR_BGR2GRAY)
+    assert int(np.count_nonzero(changed[strip_mask > 0])) > 0
+
+
 def test_solid_background_direct_cover_handles_dark_solid_surface() -> None:
     image = np.full((320, 640, 3), 248, np.uint8)
     cv2.rectangle(image, (80, 128), (520, 230), (42, 42, 42), -1)

@@ -2824,6 +2824,107 @@ def solid_background_block_cover_repair(
     }
 
 
+def textured_panel_strip_clone_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    mask: np.ndarray,
+    det: Detection,
+    *,
+    risky: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Clone a nearby same-width texture strip over a confirmed OCR text line."""
+    if mask is None or np.count_nonzero(mask) == 0:
+        return None, None, 0.0, {"reason": "empty_mask"}
+    if not det.template.startswith("ocr:") or det.ocr_watermark_score < OCR_CROP_LOCALIZE_MIN:
+        return None, None, 0.0, {"reason": "ocr_not_confirmed_for_strip_clone"}
+    if det.roi_class not in {"text_or_label_area", "complex_product_detail", "simple_product_surface", "low_texture_background"}:
+        return None, None, 0.0, {"reason": f"roi_not_textured_strip:{det.roi_class or 'unknown'}"}
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None, None, 0.0, {"reason": "empty_strip_seed"}
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    seed_x1 = max(0, int(xs.min()) + 1)
+    seed_x2 = min(img_w, int(xs.max()) + 1 - 1)
+    seed_h = max(1, int(ys.max()) - int(ys.min()) + 1)
+    strip_h = max(12, min(24, int(round(seed_h * 0.56))))
+    cy = int(round((int(ys.min()) + int(ys.max()) + 1) / 2.0))
+    y1 = max(0, cy - strip_h // 2)
+    y2 = min(img_h, y1 + strip_h)
+    y1 = max(0, y2 - strip_h)
+    x_pad = max(2, int(round(b["w"] * 0.010)))
+    x1 = max(0, seed_x1 + x_pad)
+    x2 = min(img_w, seed_x2 - x_pad)
+    if x2 - x1 < max(40, b["w"] * 0.62) or y2 - y1 < 10:
+        return None, None, 0.0, {"reason": "strip_target_too_small"}
+
+    target_rect = (x1, y1, x2, y2)
+    target = img[y1:y2, x1:x2]
+    target_gray = gray[y1:y2, x1:x2]
+    target_median = np.median(target.reshape(-1, 3), axis=0).astype(np.float32)
+    target_luma_std = float(np.std(target_gray))
+    target_edge_density = float(np.mean(cv2.Canny(target_gray, 55, 150) > 0))
+
+    best: tuple[float, tuple[int, int, int, int], np.ndarray, dict] | None = None
+    width = x2 - x1
+    height = y2 - y1
+    for gap in (1, 2, 4, 6, 9, 12):
+        for dy1 in (y2 + gap, y1 - gap - height):
+            dy2 = dy1 + height
+            if dy1 < 0 or dy2 > img_h:
+                continue
+            donor_rect = (x1, int(dy1), x2, int(dy2))
+            if _rect_overlap(target_rect, donor_rect) > 0:
+                continue
+            donor = img[dy1:dy2, x1:x2]
+            donor_gray = gray[dy1:dy2, x1:x2]
+            if donor.shape[:2] != (height, width):
+                continue
+            donor_median = np.median(donor.reshape(-1, 3), axis=0).astype(np.float32)
+            median_delta = float(np.linalg.norm(donor_median - target_median) / math.sqrt(3.0))
+            donor_luma_std = float(np.std(donor_gray))
+            std_delta = abs(donor_luma_std - target_luma_std)
+            donor_edge_density = float(np.mean(cv2.Canny(donor_gray, 55, 150) > 0))
+            if median_delta > (34.0 if risky else 42.0):
+                continue
+            if std_delta > 42.0 or donor_edge_density > 0.36:
+                continue
+            score = gap * 0.07 + median_delta * 0.055 + std_delta * 0.020 + donor_edge_density * 4.0
+            details = {
+                "textured_strip_target_box": {"x": x1, "y": y1, "w": width, "h": height},
+                "textured_strip_donor_box": {"x": x1, "y": int(dy1), "w": width, "h": height},
+                "textured_strip_median_delta": median_delta,
+                "textured_strip_std_delta": std_delta,
+                "textured_strip_edge_density": donor_edge_density,
+            }
+            if best is None or score < best[0]:
+                best = (score, donor_rect, donor.copy(), details)
+
+    if best is None:
+        return None, None, 0.0, {
+            "reason": "no_matching_texture_strip",
+            "target_luma_std": target_luma_std,
+            "target_edge_density": target_edge_density,
+        }
+
+    _, donor_rect, donor, details = best
+    strip_mask = _rect_mask(gray.shape, target_rect)
+    pasted = img.copy()
+    pasted[y1:y2, x1:x2] = donor
+    alpha = cv2.GaussianBlur(strip_mask, (0, 0), 0.85).astype(np.float32)[:, :, None] / 255.0
+    alpha[strip_mask == 0] = 0.0
+    repaired = np.uint8(np.clip(img.astype(np.float32) * (1.0 - alpha) + pasted.astype(np.float32) * alpha, 0, 255))
+    area = _mask_area(strip_mask)
+    return repaired, strip_mask, area, {
+        "operator": "textured_panel_strip_clone",
+        "textured_panel_strip_clone_used": True,
+        "repair_mask_area_pct": area * 100,
+        **details,
+        "textured_strip_donor_rect": donor_rect,
+    }
+
+
 def near_area_background_fill_repair(
     img: np.ndarray,
     gray: np.ndarray,
@@ -3557,6 +3658,41 @@ def clean_image(
         area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
         if area > area_limit:
             continue
+        strip_candidate, strip_mask, strip_area, strip_meta = textured_panel_strip_clone_repair(
+            img,
+            gray,
+            mask,
+            det,
+            risky=risky_product_roi,
+        )
+        if strip_candidate is not None and strip_mask is not None:
+            cgray = cv2.cvtColor(strip_candidate, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, strip_mask) / max(laplacian_var(gray, strip_mask), 1e-6)
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(strip_candidate)
+            cost = (
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.18
+                + alpha_probe * 0.55
+                + strip_area * (2.8 if risky_product_roi else 2.2)
+                + float(strip_meta.get("textured_strip_median_delta") or 0.0) * 0.002
+                + max(0.0, 0.12 - sharpness_ratio) * 0.18
+                - 0.24
+            )
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                strip_area,
+                f"{variant}_textured_panel_strip_clone",
+                strip_candidate,
+                strip_mask,
+                metrics,
+                {"alpha_residual_probe_score": alpha_probe, **strip_meta},
+            ))
         block_candidate, block_mask, block_area, block_meta = solid_background_block_cover_repair(
             img,
             gray,
@@ -3787,17 +3923,29 @@ def clean_image(
 
     lama_reason = ""
     if ENABLE_LAMA_ESCALATION and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
-        lama, lama_reason = run_lama_escalation(img, mask)
+        lama_mask = mask
+        lama_area = area
+        selected_mask_too_small = (
+            first_mask is not None
+            and first_area > 0.0
+            and area < first_area * 0.35
+            and det.template.startswith("ocr:")
+            and det.ocr_watermark_score >= OCR_CROP_LOCALIZE_MIN
+        )
+        if selected_mask_too_small:
+            lama_mask = first_mask
+            lama_area = first_area
+        lama, lama_reason = run_lama_escalation(img, lama_mask)
         if lama is not None:
             lgray = cv2.cvtColor(lama, cv2.COLOR_BGR2GRAY)
-            lratio = laplacian_var(lgray, mask) / max(laplacian_var(gray, mask), 1e-6)
+            lratio = laplacian_var(lgray, lama_mask) / max(laplacian_var(gray, lama_mask), 1e-6)
             lmetrics = residual_quality_metrics(lgray, det, templates)
             lresidual = lmetrics["residual_score"]
             ltemplate = lmetrics["template_residual_score"]
             lcost = (
                 min(1.0, lresidual)
                 + min(1.0, ltemplate) * 0.18
-                + area * 10.0
+                + lama_area * 10.0
                 + max(0.0, 0.18 - lratio) * 0.55
             )
             current_cost = -candidates[0][0]
@@ -3807,8 +3955,13 @@ def clean_image(
                 ratio = lratio
                 metrics = lmetrics
                 best = lama
+                mask = lama_mask
+                area = lama_area
                 name = "lama"
-                selected_extra = {}
+                selected_extra = {
+                    "lama_mask_source": "first_glyph_mask" if selected_mask_too_small else "selected_mask",
+                    "lama_mask_area_pct": lama_area * 100,
+                }
                 selected_eval = None
 
     if selected_eval is not None:
@@ -4087,6 +4240,12 @@ def clean_image(
         "solid_block_color_std": round(float(selected_extra.get("solid_block_color_std") or 0.0), 4),
         "solid_block_edge_density": round(float(selected_extra.get("solid_block_edge_density") or 0.0), 4),
         "solid_block_median_delta": round(float(selected_extra.get("solid_block_median_delta") or 0.0), 4),
+        "textured_panel_strip_clone_used": bool(selected_extra.get("textured_panel_strip_clone_used")),
+        "textured_strip_target_box": selected_extra.get("textured_strip_target_box") or {},
+        "textured_strip_donor_box": selected_extra.get("textured_strip_donor_box") or {},
+        "textured_strip_median_delta": round(float(selected_extra.get("textured_strip_median_delta") or 0.0), 4),
+        "lama_mask_source": selected_extra.get("lama_mask_source", ""),
+        "lama_mask_area_pct": round(float(selected_extra.get("lama_mask_area_pct") or 0.0), 3),
     }
     if ocr_meta.get("ocr_checked") or ocr_meta.get("ocr_error"):
         meta.update({
@@ -4321,6 +4480,15 @@ def clean_all_detections(
                 default=0.0,
             ),
             4,
+        ),
+        "textured_panel_strip_clone_used": any(bool(item.get("textured_panel_strip_clone_used")) for item in details),
+        "textured_strip_target_box": next(
+            (item.get("textured_strip_target_box") for item in details if item.get("textured_strip_target_box")),
+            {},
+        ),
+        "textured_strip_donor_box": next(
+            (item.get("textured_strip_donor_box") for item in details if item.get("textured_strip_donor_box")),
+            {},
         ),
         "candidate_count": sum(repair_candidate_counts) if repair_candidate_counts else 0,
         "best_candidate_id": next((str(item.get("best_candidate_id")) for item in details if item.get("best_candidate_id")), ""),
