@@ -117,6 +117,8 @@ MAX_SECOND_PASS_ATTEMPTS = 2
 MAX_TOTAL_REPAIR_CANDIDATES = 24
 MAX_ALPHA_REPAIR_CANDIDATES = 24
 ALPHA_EVAL_RESERVED_CANDIDATES = 8
+WHITE_EVIDENCE_EVAL_RESERVED_CANDIDATES = 6
+WHITE_EVIDENCE_ALIGNMENT_MIN = 0.58
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
@@ -480,6 +482,312 @@ def create_glyph_halo_mask(
         )
         mask = cv2.dilate(mask, kernel, iterations=1)
     return mask
+
+
+def align_glyph_mask_from_white_evidence(
+    img: np.ndarray,
+    gray: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    """Align the canonical glyphs to pale watermark pixels on white surfaces.
+
+    OCR boxes often include product pixels and extra vertical space. Centering
+    the canonical mask inside that box can therefore miss the baseline or one
+    end of the domain. White background pixels provide an independent, precise
+    observation of the watermark glyphs even when the middle crosses a product.
+    """
+    if img.shape[:2] != gray.shape[:2] or not det.mark_box:
+        return None, {"reason": "invalid_white_evidence_input"}
+    confirmed = (
+        det.template.startswith("ocr:")
+        or det.ocr_watermark_score >= OCR_CROP_LOCALIZE_MIN
+        or det.confidence >= 0.90
+    )
+    if not confirmed:
+        return None, {"reason": "white_evidence_requires_confirmed_mark"}
+
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    pad_x = max(12, int(round(b["w"] * 0.30)))
+    pad_y = max(6, int(round(b["h"] * 0.30)))
+    sx1 = max(0, int(b["x"]) - pad_x)
+    sy1 = max(0, int(b["y"]) - pad_y)
+    sx2 = min(img_w, int(b["x"] + b["w"]) + pad_x)
+    sy2 = min(img_h, int(b["y"] + b["h"]) + pad_y)
+    search_gray = gray[sy1:sy2, sx1:sx2]
+    search_bgr = img[sy1:sy2, sx1:sx2]
+    if search_gray.shape[0] < 10 or search_gray.shape[1] < 32:
+        return None, {"reason": "white_evidence_search_too_small"}
+
+    background = cv2.medianBlur(search_gray, 11)
+    saturation = cv2.cvtColor(search_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
+    white_surface = (background >= 242) & (saturation <= 72)
+    observed = (
+        white_surface
+        & (search_gray >= 70)
+        & (search_gray <= 244)
+        & ((background.astype(np.int16) - search_gray.astype(np.int16)) >= 2)
+    ).astype(np.uint8)
+    observed_count = int(np.count_nonzero(observed))
+    if observed_count < 24:
+        return None, {
+            "reason": "insufficient_white_glyph_evidence",
+            "white_evidence_pixels": observed_count,
+        }
+
+    observed_tolerant = cv2.dilate(
+        observed,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    integral = cv2.integral(observed)
+    ink = canonical_ink_mask()
+    widths = sorted({
+        max(48, int(round(float(b["w"]) * ratio)))
+        for ratio in np.linspace(0.84, 1.22, 12)
+    })
+    heights = sorted({
+        max(8, int(round(float(b["h"]) * ratio)))
+        for ratio in np.linspace(0.40, 0.82, 11)
+    })
+
+    best: tuple[float, float, float, int, int, int, int, np.ndarray] | None = None
+    for target_h in heights:
+        for target_w in widths:
+            if target_h > search_gray.shape[0] or target_w > search_gray.shape[1]:
+                continue
+            resized = cv2.resize(ink, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            core = (resized >= 20).astype(np.uint8)
+            core_count = int(np.count_nonzero(core))
+            if core_count < 20:
+                continue
+            tolerant = cv2.dilate(
+                core,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            )
+            covered_core = cv2.matchTemplate(observed_tolerant, core, cv2.TM_CCORR)
+            covered_observed = cv2.matchTemplate(observed, tolerant, cv2.TM_CCORR)
+            local_observed = (
+                integral[target_h:, target_w:]
+                - integral[:-target_h, target_w:]
+                - integral[target_h:, :-target_w]
+                + integral[:-target_h, :-target_w]
+            ).astype(np.float32)
+            precision = covered_core / max(1.0, float(core_count))
+            local_recall = covered_observed / np.maximum(1.0, local_observed)
+            global_recall = covered_observed / max(1.0, float(observed_count))
+            recall = local_recall * 0.35 + global_recall * 0.65
+            score_map = 2.0 * precision * recall / np.maximum(1e-6, precision + recall)
+            candidate_x = sx1 + np.arange(score_map.shape[1], dtype=np.int32)
+            left_ok = np.abs(candidate_x - int(b["x"])) <= max(10, int(round(b["w"] * 0.16)))
+            candidate_right = candidate_x + target_w
+            expected_right = int(b["x"] + b["w"])
+            right_ok = np.abs(candidate_right - expected_right) <= max(14, int(round(b["w"] * 0.32)))
+            valid_x = left_ok & right_ok
+            if not np.any(valid_x):
+                continue
+            score_map[:, ~valid_x] = -1.0
+            _, score, _, loc = cv2.minMaxLoc(score_map)
+            lx, ly = int(loc[0]), int(loc[1])
+            candidate_precision = float(precision[ly, lx])
+            candidate_recall = float(recall[ly, lx])
+            if best is None or score > best[0]:
+                best = (
+                    float(score),
+                    candidate_precision,
+                    candidate_recall,
+                    sx1 + lx,
+                    sy1 + ly,
+                    target_w,
+                    target_h,
+                    core,
+                )
+
+    if best is None or best[0] < WHITE_EVIDENCE_ALIGNMENT_MIN:
+        return None, {
+            "reason": "white_evidence_alignment_weak",
+            "white_evidence_alignment_score": round(float(best[0]) if best else 0.0, 4),
+            "white_evidence_pixels": observed_count,
+        }
+
+    score, precision, recall, x, y, width, height, core = best
+    local_x = x - sx1
+    local_y = y - sy1
+    support = cv2.dilate(
+        core,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)),
+        iterations=1,
+    )
+    local_delta = cv2.absdiff(
+        search_gray[local_y:local_y + height, local_x:local_x + width],
+        background[local_y:local_y + height, local_x:local_x + width],
+    )
+    local_saturation = saturation[local_y:local_y + height, local_x:local_x + width]
+    observed_glyph = (
+        (support > 0)
+        & (local_delta >= 2)
+        & (local_saturation <= 100)
+    )
+    combined = np.maximum(core * 255, observed_glyph.astype(np.uint8) * 255)
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    mask[y:y + height, x:x + width] = combined
+    return mask, {
+        "white_evidence_alignment_used": True,
+        "white_evidence_alignment_score": float(score),
+        "white_evidence_precision": float(precision),
+        "white_evidence_recall": float(recall),
+        "white_evidence_pixels": observed_count,
+        "white_evidence_supported_pixels": int(np.count_nonzero(observed_glyph)),
+        "white_evidence_alignment_bbox": {
+            "x": int(x),
+            "y": int(y),
+            "w": int(width),
+            "h": int(height),
+        },
+    }
+
+
+def white_evidence_aligned_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    aligned_mask: np.ndarray,
+    det: Detection,
+    *,
+    halo_x: int,
+    halo_y: int,
+    radius: int,
+    method: int,
+    direct_white_fill: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Repair a precisely aligned watermark mask and restore pure background."""
+    if aligned_mask is None or np.count_nonzero(aligned_mask) == 0:
+        return None, None, 0.0, {"reason": "empty_white_evidence_mask"}
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (max(1, halo_x * 2 + 1), max(1, halo_y * 2 + 1)),
+    )
+    repair_mask = cv2.dilate(aligned_mask, kernel, iterations=1)
+    area = _mask_area(repair_mask)
+    if area <= 0.0 or area > PILOT_MASK_AREA:
+        return None, repair_mask, area, {
+            "reason": "white_evidence_mask_area_limit",
+            "white_evidence_mask_area_pct": area * 100,
+        }
+
+    candidate = cv2.inpaint(img, repair_mask, radius, method)
+    white_pixels_filled = 0
+    if direct_white_fill:
+        b = det.mark_box
+        background = cv2.medianBlur(gray, 11)
+        saturation = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1]
+        white_target = (
+            (repair_mask > 0)
+            & (background >= 242)
+            & (saturation <= 72)
+        )
+        white_pixels_filled = int(np.count_nonzero(white_target))
+        if white_pixels_filled >= 8:
+            context = np.zeros_like(gray, dtype=np.uint8)
+            x1 = max(0, int(b["x"]) - max(14, int(round(b["w"] * 0.18))))
+            x2 = min(gray.shape[1], int(b["x"] + b["w"]) + max(14, int(round(b["w"] * 0.18))))
+            y1 = max(0, int(b["y"]) - max(12, int(round(b["h"] * 1.25))))
+            y2 = min(gray.shape[0], int(b["y"] + b["h"]) + max(12, int(round(b["h"] * 1.25))))
+            context[y1:y2, x1:x2] = 255
+            ring = cv2.bitwise_and(
+                context,
+                cv2.bitwise_not(cv2.dilate(repair_mask, np.ones((7, 13), np.uint8), iterations=1)),
+            )
+            clean_white = (ring > 0) & (gray >= 242) & (saturation <= 72)
+            samples = img[clean_white]
+            if samples.size:
+                fill = np.median(samples.reshape(-1, 3), axis=0).astype(np.uint8)
+                candidate[white_target] = fill
+
+    method_name = "ns" if method == cv2.INPAINT_NS else "telea"
+    return candidate, repair_mask, area, {
+        "operator": "white_evidence_aligned_repair",
+        "white_evidence_alignment_used": True,
+        "white_evidence_halo_x": int(halo_x),
+        "white_evidence_halo_y": int(halo_y),
+        "white_evidence_inpaint_radius": int(radius),
+        "white_evidence_inpaint_method": method_name,
+        "white_evidence_direct_fill": bool(direct_white_fill),
+        "white_evidence_direct_fill_pixels": white_pixels_filled,
+        "repair_mask_area_pct": area * 100,
+    }
+
+
+def white_evidence_surface_fill_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    aligned_mask: np.ndarray,
+    det: Detection,
+    *,
+    halo_x: int,
+    halo_y: int,
+    median_kernel: int,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Replace aligned glyphs with the nearest local surface color/texture."""
+    if aligned_mask is None or np.count_nonzero(aligned_mask) == 0:
+        return None, None, 0.0, {"reason": "empty_white_evidence_mask"}
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (max(1, halo_x * 2 + 1), max(1, halo_y * 2 + 1)),
+    )
+    repair_mask = cv2.dilate(aligned_mask, kernel, iterations=1)
+    area = _mask_area(repair_mask)
+    if area <= 0.0 or area > PILOT_MASK_AREA:
+        return None, repair_mask, area, {
+            "reason": "white_evidence_surface_mask_area_limit",
+            "white_evidence_mask_area_pct": area * 100,
+        }
+
+    median_kernel = max(5, int(median_kernel) | 1)
+    donor = cv2.medianBlur(img, median_kernel)
+    candidate = img.copy()
+    candidate[repair_mask > 0] = donor[repair_mask > 0]
+
+    background_kernel = max(21, min(41, median_kernel + 10))
+    background = cv2.medianBlur(gray, background_kernel)
+    saturation = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1]
+    white_target = (
+        (repair_mask > 0)
+        & (background >= 225)
+        & (saturation <= 72)
+    )
+    white_pixels_filled = int(np.count_nonzero(white_target))
+    if white_pixels_filled >= 8:
+        b = det.mark_box
+        context = np.zeros_like(gray, dtype=np.uint8)
+        pad_x = max(14, int(round(b["w"] * 0.18)))
+        pad_y = max(12, int(round(b["h"] * 1.25)))
+        x1 = max(0, int(b["x"]) - pad_x)
+        x2 = min(gray.shape[1], int(b["x"] + b["w"]) + pad_x)
+        y1 = max(0, int(b["y"]) - pad_y)
+        y2 = min(gray.shape[0], int(b["y"] + b["h"]) + pad_y)
+        context[y1:y2, x1:x2] = 255
+        ring = cv2.bitwise_and(
+            context,
+            cv2.bitwise_not(cv2.dilate(repair_mask, np.ones((7, 13), np.uint8), iterations=1)),
+        )
+        clean_white = (ring > 0) & (gray >= 242) & (saturation <= 72)
+        samples = img[clean_white]
+        if samples.size:
+            fill = np.median(samples.reshape(-1, 3), axis=0).astype(np.uint8)
+            candidate[white_target] = fill
+
+    return candidate, repair_mask, area, {
+        "operator": "white_evidence_surface_fill",
+        "white_evidence_alignment_used": True,
+        "white_evidence_surface_fill": True,
+        "white_evidence_halo_x": int(halo_x),
+        "white_evidence_halo_y": int(halo_y),
+        "white_evidence_median_kernel": int(median_kernel),
+        "white_evidence_direct_fill": True,
+        "white_evidence_direct_fill_pixels": white_pixels_filled,
+        "repair_mask_area_pct": area * 100,
+    }
 
 
 def derived_text_templates(name: str, gray: np.ndarray) -> list[TemplateSpec]:
@@ -3648,6 +3956,139 @@ def clean_image(
             if alpha_candidate_count >= MAX_ALPHA_REPAIR_CANDIDATES:
                 break
 
+    aligned_white_mask, white_alignment_meta = align_glyph_mask_from_white_evidence(img, gray, det)
+    if aligned_white_mask is not None:
+        aligned_variants = (
+            ("ns_r1", 2, 1, 1, cv2.INPAINT_NS, False),
+            ("ns_r2_fill", 3, 2, 2, cv2.INPAINT_NS, True),
+            ("telea_r1_fill", 2, 1, 1, cv2.INPAINT_TELEA, True),
+            ("telea_r2", 3, 2, 2, cv2.INPAINT_TELEA, False),
+        )
+        for suffix, halo_x, halo_y, radius, method, direct_fill in aligned_variants:
+            (
+                aligned_candidate,
+                aligned_repair_mask,
+                aligned_area,
+                aligned_repair_meta,
+            ) = white_evidence_aligned_repair(
+                img,
+                gray,
+                aligned_white_mask,
+                det,
+                halo_x=halo_x,
+                halo_y=halo_y,
+                radius=radius,
+                method=method,
+                direct_white_fill=direct_fill,
+            )
+            if aligned_candidate is None or aligned_repair_mask is None:
+                continue
+            if first_mask is None:
+                first_mask = aligned_repair_mask
+                first_area = aligned_area
+            cgray = cv2.cvtColor(aligned_candidate, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, aligned_repair_mask) / max(
+                laplacian_var(gray, aligned_repair_mask),
+                1e-6,
+            )
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(aligned_candidate)
+            alignment_score = float(white_alignment_meta.get("white_evidence_alignment_score") or 0.0)
+            cost = (
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.25
+                + alpha_probe * 0.85
+                + aligned_area * (7.0 if risky_product_roi else 5.0)
+                + max(0.0, 0.14 - sharpness_ratio) * 0.30
+                - min(0.22, alignment_score * 0.22)
+            )
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                aligned_area,
+                f"white_evidence_aligned_{suffix}",
+                aligned_candidate,
+                aligned_repair_mask,
+                metrics,
+                {
+                    "white_evidence_candidate": True,
+                    "alpha_residual_probe_score": alpha_probe,
+                    **white_alignment_meta,
+                    **aligned_repair_meta,
+                },
+            ))
+        for suffix, halo_x, halo_y, median_kernel in (
+            ("surface_fill_k15", 2, 1, 15),
+            ("surface_fill_k21", 3, 2, 21),
+        ):
+            (
+                aligned_candidate,
+                aligned_repair_mask,
+                aligned_area,
+                aligned_repair_meta,
+            ) = white_evidence_surface_fill_repair(
+                img,
+                gray,
+                aligned_white_mask,
+                det,
+                halo_x=halo_x,
+                halo_y=halo_y,
+                median_kernel=median_kernel,
+            )
+            if aligned_candidate is None or aligned_repair_mask is None:
+                continue
+            if first_mask is None:
+                first_mask = aligned_repair_mask
+                first_area = aligned_area
+            cgray = cv2.cvtColor(aligned_candidate, cv2.COLOR_BGR2GRAY)
+            sharpness_ratio = laplacian_var(cgray, aligned_repair_mask) / max(
+                laplacian_var(gray, aligned_repair_mask),
+                1e-6,
+            )
+            metrics = residual_quality_metrics(cgray, det, templates)
+            residual = metrics["residual_score"]
+            template_residual = metrics["template_residual_score"]
+            alpha_probe = alpha_probe_score(aligned_candidate)
+            alignment_score = float(white_alignment_meta.get("white_evidence_alignment_score") or 0.0)
+            direct_fill_fraction = float(
+                aligned_repair_meta.get("white_evidence_direct_fill_pixels") or 0
+            ) / max(1, int(np.count_nonzero(aligned_repair_mask)))
+            surface_priority = (
+                min(0.34, direct_fill_fraction * 0.40)
+                if alignment_score >= 0.72
+                else 0.0
+            )
+            cost = (
+                min(1.0, residual)
+                + min(1.0, template_residual) * 0.25
+                + alpha_probe * 0.85
+                + aligned_area * (6.0 if risky_product_roi else 4.5)
+                + max(0.0, 0.14 - sharpness_ratio) * 0.24
+                - min(0.28, alignment_score * 0.28)
+                - surface_priority
+            )
+            candidates.append((
+                -cost,
+                residual,
+                template_residual,
+                sharpness_ratio,
+                aligned_area,
+                f"white_evidence_aligned_{suffix}",
+                aligned_candidate,
+                aligned_repair_mask,
+                metrics,
+                {
+                    "white_evidence_candidate": True,
+                    "alpha_residual_probe_score": alpha_probe,
+                    **white_alignment_meta,
+                    **aligned_repair_meta,
+                },
+            ))
+
     for variant, pad_x, pad_y, dilate_px, radius, glyph in variants:
         mask, area = create_mask(gray, det, img=img, pad_x=pad_x, pad_y=pad_y, dilate_px=dilate_px, glyph=glyph)
         if mask is None:
@@ -3855,6 +4296,12 @@ def clean_image(
 
     for cand in candidates[:4]:
         add_eval_candidate(cand)
+    for cand in [
+        item
+        for item in candidates
+        if item[9].get("white_evidence_candidate")
+    ][:WHITE_EVIDENCE_EVAL_RESERVED_CANDIDATES]:
+        add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate") and "solved" in item[5]][:ALPHA_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate")][:ALPHA_EVAL_RESERVED_CANDIDATES]:
@@ -3900,6 +4347,10 @@ def clean_image(
             "visible_band_score": round(float(cband_metrics.get("visible_band_score") or 0.0), 4),
             "product_blob_score": round(float(cproduct_metrics.get("product_blob_score") or 0.0), 4),
             "alpha_alignment_score": round(float(cextra.get("alpha_alignment_score") or 0.0), 4),
+            "white_evidence_alignment_score": round(
+                float(cextra.get("white_evidence_alignment_score") or 0.0),
+                4,
+            ),
             "alpha_template_residual_after": round(float(calpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
             "reject_reasons": list(cgate_meta.get("reject_reasons") or []),
         })
@@ -4229,6 +4680,21 @@ def clean_image(
         "alpha_template_residual_after": round(float(alpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
         "alpha_residual_reduction": round(float(alpha_metrics.get("alpha_residual_reduction") or 0.0), 4),
         "thin_residual_inpaint": bool(selected_extra.get("thin_residual_inpaint")),
+        "white_evidence_alignment_used": bool(selected_extra.get("white_evidence_alignment_used")),
+        "white_evidence_alignment_score": round(
+            float(selected_extra.get("white_evidence_alignment_score") or 0.0),
+            4,
+        ),
+        "white_evidence_precision": round(float(selected_extra.get("white_evidence_precision") or 0.0), 4),
+        "white_evidence_recall": round(float(selected_extra.get("white_evidence_recall") or 0.0), 4),
+        "white_evidence_pixels": int(selected_extra.get("white_evidence_pixels") or 0),
+        "white_evidence_alignment_bbox": selected_extra.get("white_evidence_alignment_bbox") or {},
+        "white_evidence_direct_fill": bool(selected_extra.get("white_evidence_direct_fill")),
+        "white_evidence_direct_fill_pixels": int(
+            selected_extra.get("white_evidence_direct_fill_pixels") or 0
+        ),
+        "white_evidence_surface_fill": bool(selected_extra.get("white_evidence_surface_fill")),
+        "white_evidence_median_kernel": int(selected_extra.get("white_evidence_median_kernel") or 0),
         "solid_background_cover_used": bool(selected_extra.get("solid_background_cover_used")),
         "solid_block_cover_used": bool(selected_extra.get("solid_block_cover_used")),
         "solid_cover_target": selected_extra.get("solid_cover_target", ""),

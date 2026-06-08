@@ -38,6 +38,8 @@ inventory images
 -> confirm Sunsky presence with OCR/template evidence
 -> classify the region under the mark
 -> generate repair candidates
+   -> white-background glyph-evidence alignment
+   -> same-surface direct fill for aligned glyphs
    -> Sunsky reverse-alpha candidates
    -> thin alpha-edge cleanup
    -> near-white/background fill
@@ -102,6 +104,21 @@ This is important for images where the watermark crosses:
 - screws and connectors;
 - screen assemblies;
 - red, teal, blue, gray, or black product surfaces.
+
+### White-Background Glyph Evidence Alignment
+
+OCR boxes are deliberately recall-oriented and can contain extra vertical space, nearby product pixels, or a truncated `.com` tail. ClearMark therefore performs a second geometric alignment when part of the confirmed watermark is visible on a white or near-white surface.
+
+The aligner:
+
+- estimates the local white surface with a median background model;
+- extracts neutral gray pixels that are darker than that surface;
+- searches independent glyph width, glyph height, x offset, and y offset;
+- scores canonical glyph coverage against both local and full-line observed evidence;
+- expands the OCR search window far enough to recover a clipped left or right domain tail;
+- returns no mask when evidence or alignment confidence is insufficient.
+
+This corrects the previous failure mode where a canonical mask was centered inside a loose OCR box and covered only the middle of `sunsky-online.com`.
 
 ### Box Normalization
 
@@ -201,6 +218,19 @@ The second pass is not allowed when the blocker is a visible band, product damag
 For `plain_white`, `near_white`, and `low_texture_background`, ClearMark can use a row-local background fill. It estimates nearby luma/chroma from a clean context ring and fills only the watermark mask with small matched noise.
 
 This avoids gray halos and avoids broad white rectangles.
+
+### Aligned Same-Surface Fill
+
+When white-background evidence aligns the full glyph line, ClearMark generates a segmented same-surface candidate. It does not cover the whole OCR rectangle. It changes only the aligned glyph mask plus a small anti-alias halo.
+
+For each masked pixel, a larger local window estimates the underlying surface:
+
+- confirmed white background is replaced directly with the median of nearby clean white pixels;
+- dark flex or product surfaces use a local median texture/color donor;
+- gray and colored solid surfaces use their own local median surface;
+- pixels outside the aligned glyph mask are preserved exactly.
+
+Two conservative mask widths and local-surface kernels are generated. The stronger candidate receives ranking priority only when full-line alignment confidence is high and most changed pixels are independently classified as pure background. All variants still pass through product-damage, visible-band, OCR, detector, dot-chain, template, and alpha-residual QA.
 
 ### Solid Background Direct Cover
 
@@ -334,6 +364,14 @@ Each processed image records diagnostic fields such as:
   "alpha_best_gain": 1.0,
   "alpha_best_logo_bgr": [180, 180, 180],
   "thin_residual_inpaint": true,
+  "white_evidence_alignment_used": true,
+  "white_evidence_alignment_score": 0.0,
+  "white_evidence_precision": 0.0,
+  "white_evidence_recall": 0.0,
+  "white_evidence_pixels": 0,
+  "white_evidence_alignment_bbox": {"x": 0, "y": 0, "w": 0, "h": 0},
+  "white_evidence_surface_fill": true,
+  "white_evidence_median_kernel": 15,
   "solid_background_cover_used": false,
   "solid_cover_target": "",
   "solid_cover_area_pct": 0.0,

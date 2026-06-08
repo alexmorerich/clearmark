@@ -167,6 +167,101 @@ def test_alpha_candidates_are_reserved_for_gate_evaluation(monkeypatch) -> None:
     )
 
 
+def test_white_evidence_alignment_recovers_full_glyph_line_across_product() -> None:
+    clean = np.full((320, 640, 3), 248, np.uint8)
+    product = np.array([[176, 72], [246, 72], [282, 172], [210, 172]], np.int32)
+    cv2.fillConvexPoly(clean, product, (32, 32, 32))
+
+    ink = pipeline.canonical_ink_mask()
+    target_x, target_y, target_w, target_h = 102, 104, 214, 16
+    resized = cv2.resize(ink, (target_w, target_h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    alpha = resized * 0.42
+    watermarked = clean.copy().astype(np.float32)
+    crop = watermarked[target_y:target_y + target_h, target_x:target_x + target_w]
+    logo = np.full_like(crop, 184.0)
+    crop[:] = crop * (1.0 - alpha[:, :, None]) + logo * alpha[:, :, None]
+    watermarked = np.uint8(np.clip(watermarked, 0, 255))
+    gray = cv2.cvtColor(watermarked, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=88,
+        y=88,
+        w=226,
+        h=38,
+        score=0.93,
+        verify_score=0.91,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 88, "y": 88, "w": 226, "h": 38},
+        mask_area_pct=0.8,
+        text_score=0.94,
+        text_components=14,
+        confidence=0.95,
+        ocr_watermark_score=0.94,
+        roi_class="text_or_label_area",
+        product_overlap=0.55,
+    )
+
+    aligned, meta = pipeline.align_glyph_mask_from_white_evidence(watermarked, gray, det)
+
+    assert aligned is not None
+    assert meta["white_evidence_alignment_used"] is True
+    assert meta["white_evidence_alignment_score"] >= pipeline.WHITE_EVIDENCE_ALIGNMENT_MIN
+    bbox = meta["white_evidence_alignment_bbox"]
+    assert abs(bbox["x"] - target_x) <= 8
+    assert abs(bbox["y"] - target_y) <= 5
+    assert abs(bbox["w"] - target_w) <= 18
+    assert abs(bbox["h"] - target_h) <= 5
+    expected = np.zeros_like(gray)
+    expected[target_y:target_y + target_h, target_x:target_x + target_w] = (resized >= 0.08).astype(np.uint8) * 255
+    overlap = np.count_nonzero((cv2.dilate(aligned, np.ones((3, 3), np.uint8)) > 0) & (expected > 0))
+    assert overlap / max(1, np.count_nonzero(expected)) >= 0.72
+
+    repaired, repair_mask, _, repair_meta = pipeline.white_evidence_surface_fill_repair(
+        watermarked,
+        gray,
+        aligned,
+        det,
+        halo_x=2,
+        halo_y=1,
+        median_kernel=15,
+    )
+    assert repaired is not None
+    assert repair_mask is not None
+    assert repair_meta["white_evidence_surface_fill"] is True
+    before_error = np.mean(cv2.absdiff(watermarked, clean)[expected > 0])
+    after_error = np.mean(cv2.absdiff(repaired, clean)[expected > 0])
+    assert after_error < before_error * 0.70
+    changed = cv2.cvtColor(cv2.absdiff(watermarked, repaired), cv2.COLOR_BGR2GRAY)
+    assert int(np.count_nonzero(changed[repair_mask == 0])) == 0
+
+
+def test_white_evidence_alignment_is_safe_noop_without_white_glyph_evidence() -> None:
+    image = np.full((160, 300, 3), 36, np.uint8)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    det = pipeline.Detection(
+        x=70,
+        y=66,
+        w=170,
+        h=28,
+        score=0.92,
+        verify_score=0.90,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 70, "y": 66, "w": 170, "h": 28},
+        mask_area_pct=0.6,
+        text_score=0.90,
+        text_components=12,
+        confidence=0.94,
+        ocr_watermark_score=0.93,
+        roi_class="dark_product_surface",
+    )
+
+    aligned, meta = pipeline.align_glyph_mask_from_white_evidence(image, gray, det)
+
+    assert aligned is None
+    assert meta["reason"] == "insufficient_white_glyph_evidence"
+
+
 def test_residual_second_pass_uses_roi_specific_repairs(monkeypatch) -> None:
     image = np.full((120, 220, 3), 58, np.uint8)
     cv2.putText(image, "sunsky-online.com", (36, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (138, 138, 138), 1, cv2.LINE_AA)
