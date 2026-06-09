@@ -615,3 +615,118 @@ def test_solid_background_direct_cover_handles_dark_solid_surface() -> None:
     changed = cv2.absdiff(image, repaired)
     assert int(np.count_nonzero(cv2.cvtColor(changed, cv2.COLOR_BGR2GRAY)[cover_mask > 0])) > 0
     assert int(np.median(repaired[170:190, 188:390])) <= 62
+
+
+def test_segmented_surface_repair_preserves_dark_and_light_regions() -> None:
+    clean = np.full((240, 520, 3), 248, np.uint8)
+    cable = np.array(
+        [[72, 90], [226, 90], [342, 148], [326, 174], [210, 118], [72, 118]],
+        np.int32,
+    )
+    cv2.fillPoly(clean, [cable], (36, 38, 40))
+    image = clean.copy()
+    cv2.putText(
+        image,
+        "sunsky-online.com",
+        (112, 121),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.54,
+        (168, 168, 168),
+        1,
+        cv2.LINE_AA,
+    )
+    det = pipeline.Detection(
+        x=102,
+        y=96,
+        w=250,
+        h=38,
+        score=0.94,
+        verify_score=0.92,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 102, "y": 96, "w": 250, "h": 38},
+        mask_area_pct=0.8,
+        text_score=0.94,
+        text_components=14,
+        confidence=0.96,
+        ocr_watermark_score=0.95,
+        roi_class="dark_product_surface",
+        product_overlap=0.68,
+    )
+    diff = cv2.cvtColor(cv2.absdiff(image, clean), cv2.COLOR_BGR2GRAY)
+    repair_mask = cv2.dilate(
+        (diff > 2).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)),
+        iterations=1,
+    )
+
+    repaired, used_mask, _, meta = pipeline.segmented_nearest_surface_repair(
+        image,
+        repair_mask,
+        det,
+    )
+
+    assert repaired is not None
+    assert used_mask is not None
+    assert meta["segmented_surface_repair_used"] is True
+    outside_change = cv2.cvtColor(cv2.absdiff(image, repaired), cv2.COLOR_BGR2GRAY)
+    assert int(np.count_nonzero(outside_change[used_mask == 0])) == 0
+    clean_luma = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+    repaired_luma = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)
+    dark_target = (used_mask > 0) & (clean_luma < 100)
+    light_target = (used_mask > 0) & (clean_luma > 230)
+    assert int(np.median(repaired_luma[dark_target])) < 80
+    assert int(np.median(repaired_luma[light_target])) > 225
+    before_error = float(np.mean(cv2.absdiff(image, clean)[used_mask > 0]))
+    after_error = float(np.mean(cv2.absdiff(repaired, clean)[used_mask > 0]))
+    assert after_error < before_error * 0.65
+    product = pipeline.detect_product_damage_v13(image, repaired, used_mask, det)
+    assert product["product_blob_score"] < 0.10
+
+
+def test_low_texture_plane_repair_reconstructs_smooth_screen() -> None:
+    height, width = 300, 620
+    yy, xx = np.indices((height, width))
+    base = 222.0 + yy * 0.035 + xx * 0.018
+    clean_gray = np.uint8(np.clip(base, 0, 255))
+    clean = cv2.merge([clean_gray, clean_gray, clean_gray])
+    image = clean.copy()
+    cv2.putText(
+        image,
+        "sunsky-online.com",
+        (172, 154),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (174, 174, 174),
+        1,
+        cv2.LINE_AA,
+    )
+    det = pipeline.Detection(
+        x=158,
+        y=128,
+        w=248,
+        h=42,
+        score=0.95,
+        verify_score=0.94,
+        template="ocr:unit",
+        scale=1.0,
+        mark_box={"x": 158, "y": 128, "w": 248, "h": 42},
+        mask_area_pct=0.9,
+        text_score=0.95,
+        text_components=14,
+        confidence=0.97,
+        ocr_watermark_score=0.96,
+        roi_class="low_texture_background",
+        product_overlap=0.20,
+    )
+
+    repaired, repair_mask, _, meta = pipeline.low_texture_plane_repair(image, det)
+
+    assert repaired is not None
+    assert repair_mask is not None
+    assert meta["low_texture_plane_repair_used"] is True
+    before_error = float(np.mean(cv2.absdiff(image, clean)[repair_mask > 0]))
+    after_error = float(np.mean(cv2.absdiff(repaired, clean)[repair_mask > 0]))
+    assert after_error < before_error * 0.20
+    outside_change = cv2.cvtColor(cv2.absdiff(image, repaired), cv2.COLOR_BGR2GRAY)
+    assert int(np.count_nonzero(outside_change[repair_mask == 0])) == 0

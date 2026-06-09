@@ -40,11 +40,13 @@ inventory images
 -> generate repair candidates
    -> white-background glyph-evidence alignment
    -> same-surface direct fill for aligned glyphs
+   -> segmented nearest-surface reconstruction for mixed white/dark/color lines
+   -> low-texture column-plane reconstruction for screens and smooth panels
    -> Sunsky reverse-alpha candidates
    -> thin alpha-edge cleanup
    -> near-white/background fill
    -> Telea / Navier-Stokes inpaint
-   -> optional LaMa escalation
+   -> optional LaMa escalation on safe low-overlap surfaces only
    -> residual-only cleanup
       -> residual evidence mask
       -> row/ring fill, thin inpaint, and ROI-specific repair candidates
@@ -232,6 +234,46 @@ For each masked pixel, a larger local window estimates the underlying surface:
 
 Two conservative mask widths and local-surface kernels are generated. The stronger candidate receives ranking priority only when full-line alignment confidence is high and most changed pixels are independently classified as pure background. All variants still pass through product-damage, visible-band, OCR, detector, dot-chain, template, and alpha-residual QA.
 
+### Segmented Nearest-Surface Reconstruction
+
+A single Sunsky line can cross several different materials at once, for example white background, black flex cable, gray metal, and a colored adhesive tab. Filling the entire line from one donor color creates white holes on dark products or dark smears on white background.
+
+`segmented_nearest_surface_repair()` builds a local background model with a median filter, then classifies the confirmed glyph footprint into:
+
+- dark product or cable surface;
+- colored surface;
+- light or white surface.
+
+Each target pixel is restored from the nearest clean donor in the same surface class. OpenCV distance-transform labels are explicitly mapped back to donor coordinates; labels are never assumed to match array row order. The original dark silhouette is morphologically closed across watermark glyph holes so thin cables do not shrink after cleaning.
+
+The operator changes only the supplied watermark mask. It does not copy a full rectangle. Alpha-aligned and normal glyph masks both receive segmented candidates, and a reserved evaluation budget ensures those candidates reach the complete publish gate.
+
+Manifest evidence includes:
+
+```json
+{
+  "segmented_surface_repair_used": true,
+  "segmented_surface_area_pct": 0.0,
+  "segmented_surface_filled_pixels": 0,
+  "segmented_surface_class_counts": {"dark": 0, "color": 0, "light": 0},
+  "segmented_surface_close_kernel": [0, 0],
+  "segmented_surface_background_kernel": 0
+}
+```
+
+### Low-Texture Column-Plane Reconstruction
+
+For a smooth LCD, digitizer, white card, or other low-texture plane, a glyph-only inpaint can leave readable dots and halos. `low_texture_plane_repair()` reconstructs the confirmed text band from the nearest rows immediately above and below it.
+
+The reconstruction is calculated independently for every image column. This preserves a stable boundary when the watermark crosses two smooth regions, such as a black bezel and a gray screen. The candidate is allowed only when:
+
+- the ROI is `plain_white`, `near_white`, or `low_texture_background`;
+- context edge density is low;
+- the above/below row difference is small;
+- the target remains inside the OCR/template-supported text band.
+
+The method records `plane_target_box`, `plane_context_edge_density`, `plane_context_std`, and `plane_context_row_delta`. It remains subject to the same residual, band, product-damage, OCR, detector, dot-chain, and alpha-template gates.
+
 ### Solid Background Direct Cover
 
 For confirmed Sunsky text on pure white, dark solid product surfaces, or other low-texture solid color areas, ClearMark generates a direct background-cover candidate. Instead of asking inpaint to infer the background from narrow glyph strokes, it expands to the OCR/template-supported glyph halo and left/right tails, then writes a local background estimate directly over that watermark footprint.
@@ -293,7 +335,13 @@ This is optional and requires high similarity. Shape mismatch is rejected by the
 
 ### Generic Inpaint And Optional LaMa
 
-Telea, Navier-Stokes, and optional LaMa remain fallback candidates. They are not allowed to bypass OCR, dot-chain, product-damage, visible-band, or alpha-template residual checks.
+Telea and Navier-Stokes remain fallback candidates. LaMa is allowed only on plain, near-white, low-texture, or simple product surfaces with low product overlap. It is not used as a final override on dark product surfaces, thin flex cables, complex assemblies, or text/label areas because broad generative fills can create pale holes or erase real product detail.
+
+No inpaint method can bypass OCR, dot-chain, product-damage, visible-band, or alpha-template residual checks.
+
+### Failed Candidate Selection
+
+When no candidate passes, `attempts/` still needs to show the safest useful review image. ClearMark evaluates failed candidates with the complete QA metrics and prefers lower product damage, lower band visibility, lower residual evidence, and smaller changed area. This affects only the failed preview; it never converts a failed result into `cleaned/`.
 
 ## Quality Review Methods And Criteria
 
@@ -314,6 +362,19 @@ A cleaned candidate must pass:
 - required metric validity checks.
 
 If any required signal fails, the image is marked `needs_manual`. Runs with `--no-ocr` are useful for fast review diagnostics, but they cannot write automatic `cleaned/` outputs because the independent OCR double-check is unavailable.
+
+| Evidence | Publish criterion |
+| --- | --- |
+| Presence | Sunsky presence confirmed and a valid `mark_box` exists |
+| Visible residual | `residual_score <= 0.18` |
+| Canonical template | `template_residual_score <= 0.20` |
+| Text components | `post_text_components <= 1` and post-clean detector count is `0` |
+| OCR | OCR check ran, did not read Sunsky, and score is `< 0.62` |
+| Alpha template | after score `<= 0.08`; when before score is above `0.08`, reduction is at least `0.55` |
+| Dot chain | dot-chain gate is false; aligned residual fragments are not tolerated |
+| Visible band | no rectangular-band failure; luma and boundary evidence remain below the strict band gate |
+| Product safety | no product-damage failure; contours, labels, cables, and color surfaces remain protected |
+| Metrics | all required metrics are finite and valid |
 
 ### Residual Watermark Criteria
 
@@ -347,6 +408,8 @@ The repair must not damage product contours, labels, dark surfaces, cables, or c
 - bright/dark blob formation;
 - changed area ratio inside protected regions.
 
+Blob detection is polarity-aware. Restoring a gray watermark pixel back to an original dark cable is not treated as a dark defect. A dark blob is counted only when an originally bright surface is abnormally darkened; a bright blob is counted only when an originally dark surface is abnormally brightened.
+
 ### Manifest And Review Fields
 
 Each processed image records diagnostic fields such as:
@@ -372,6 +435,14 @@ Each processed image records diagnostic fields such as:
   "white_evidence_alignment_bbox": {"x": 0, "y": 0, "w": 0, "h": 0},
   "white_evidence_surface_fill": true,
   "white_evidence_median_kernel": 15,
+  "segmented_surface_repair_used": false,
+  "segmented_surface_area_pct": 0.0,
+  "segmented_surface_filled_pixels": 0,
+  "segmented_surface_class_counts": {},
+  "low_texture_plane_repair_used": false,
+  "plane_target_box": {},
+  "plane_context_edge_density": 0.0,
+  "plane_context_row_delta": 0.0,
   "solid_background_cover_used": false,
   "solid_cover_target": "",
   "solid_cover_area_pct": 0.0,
@@ -425,7 +496,7 @@ python3 scripts/watermark_pipeline.py pilot \
   --preset review \
   --pdf \
   --telegram \
-  --out /Users/alexkou/Downloads/clearmark-alpha-v1 \
+  --out /Users/alexkou/Downloads/clearmark-review \
   --rights-confirmed
 ```
 

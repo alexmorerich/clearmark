@@ -119,6 +119,7 @@ MAX_ALPHA_REPAIR_CANDIDATES = 24
 ALPHA_EVAL_RESERVED_CANDIDATES = 8
 WHITE_EVIDENCE_EVAL_RESERVED_CANDIDATES = 6
 WHITE_EVIDENCE_ALIGNMENT_MIN = 0.58
+SEGMENTED_SURFACE_EVAL_RESERVED_CANDIDATES = 6
 COMBINED_MASK_REVIEW_AREA = 0.035
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
@@ -786,6 +787,200 @@ def white_evidence_surface_fill_repair(
         "white_evidence_median_kernel": int(median_kernel),
         "white_evidence_direct_fill": True,
         "white_evidence_direct_fill_pixels": white_pixels_filled,
+        "repair_mask_area_pct": area * 100,
+    }
+
+
+def segmented_nearest_surface_repair(
+    original_bgr: np.ndarray,
+    repair_mask: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Restore each glyph pixel from the nearest matching surface class.
+
+    The confirmed watermark often crosses a white background, a dark cable,
+    and a colored label in the same line. A single fill color or unconstrained
+    inpaint cannot preserve those boundaries. This operator reconstructs those
+    surface classes independently while changing only the glyph footprint.
+    """
+    if repair_mask is None or np.count_nonzero(repair_mask) < 8:
+        return None, None, 0.0, {"reason": "empty_segmented_surface_mask"}
+    area = _mask_area(repair_mask)
+    if area <= 0.0 or area > COMBINED_MASK_REVIEW_AREA:
+        return None, repair_mask, area, {
+            "reason": "segmented_surface_area_limit",
+            "segmented_surface_area_pct": area * 100,
+        }
+
+    gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+    surface_kernel = max(15, min(35, (int(round(det.mark_box["h"] * 0.65)) | 1)))
+    surface_bgr = cv2.medianBlur(original_bgr, surface_kernel)
+    surface_gray = cv2.cvtColor(surface_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(surface_bgr, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    b = det.mark_box
+    close_w = max(11, min(31, int(round(b["w"] * 0.08)) | 1))
+    close_h = max(7, min(13, int(round(b["h"] * 0.22)) | 1))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_w, close_h))
+    dark_surface = (surface_gray < 178).astype(np.uint8) * 255
+    raw_dark_surface = (gray < 150).astype(np.uint8) * 255
+    raw_dark_surface = cv2.morphologyEx(
+        raw_dark_surface,
+        cv2.MORPH_CLOSE,
+        close_kernel,
+        iterations=1,
+    )
+    dark_surface = cv2.bitwise_or(dark_surface, raw_dark_surface)
+    dark_surface = cv2.morphologyEx(
+        dark_surface,
+        cv2.MORPH_CLOSE,
+        close_kernel,
+        iterations=1,
+    )
+    color_surface = ((saturation > 52) & (surface_gray < 238)).astype(np.uint8) * 255
+    color_surface = cv2.bitwise_and(color_surface, cv2.bitwise_not(dark_surface))
+    light_surface = cv2.bitwise_and(
+        cv2.bitwise_not(dark_surface),
+        cv2.bitwise_not(color_surface),
+    )
+    classes = (
+        ("dark", dark_surface, gray < 150),
+        ("color", color_surface, cv2.cvtColor(original_bgr, cv2.COLOR_BGR2HSV)[:, :, 1] > 42),
+        ("light", light_surface, gray > 182),
+    )
+
+    source = cv2.bilateralFilter(original_bgr, 7, 20, 20)
+    exclude = cv2.dilate(
+        (repair_mask > 0).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 5)),
+        iterations=1,
+    )
+    repaired = original_bgr.copy()
+    class_counts: dict[str, int] = {}
+    filled_total = 0
+    for class_name, class_mask, donor_filter in classes:
+        target = (repair_mask > 0) & (class_mask > 0)
+        target_count = int(np.count_nonzero(target))
+        class_counts[class_name] = target_count
+        if target_count == 0:
+            continue
+        valid = (class_mask > 0) & (exclude == 0) & donor_filter
+        donor_y, donor_x = np.where(valid)
+        if len(donor_x) < 12:
+            continue
+        distance_field = np.full(gray.shape, 255, dtype=np.uint8)
+        distance_field[valid] = 0
+        _, labels = cv2.distanceTransformWithLabels(
+            distance_field,
+            cv2.DIST_L2,
+            5,
+            labelType=cv2.DIST_LABEL_PIXEL,
+        )
+        target_y, target_x = np.where(target)
+        donor_labels = labels[donor_y, donor_x].astype(np.int64)
+        max_label = int(labels.max())
+        label_y = np.full(max_label + 1, -1, dtype=np.int32)
+        label_x = np.full(max_label + 1, -1, dtype=np.int32)
+        label_y[donor_labels] = donor_y
+        label_x[donor_labels] = donor_x
+        target_labels = labels[target_y, target_x].astype(np.int64)
+        valid_indices = (
+            (target_labels > 0)
+            & (target_labels <= max_label)
+            & (label_y[target_labels] >= 0)
+        )
+        if not np.any(valid_indices):
+            continue
+        repaired[target_y[valid_indices], target_x[valid_indices]] = source[
+            label_y[target_labels[valid_indices]],
+            label_x[target_labels[valid_indices]],
+        ]
+        filled_total += int(np.count_nonzero(valid_indices))
+
+    if filled_total < max(8, int(np.count_nonzero(repair_mask) * 0.72)):
+        return None, repair_mask, area, {
+            "reason": "insufficient_segmented_surface_donors",
+            "segmented_surface_filled_pixels": filled_total,
+            "segmented_surface_class_counts": class_counts,
+        }
+    return repaired, repair_mask, area, {
+        "operator": "segmented_nearest_surface_repair",
+        "segmented_surface_repair_used": True,
+        "segmented_surface_area_pct": area * 100,
+        "segmented_surface_filled_pixels": filled_total,
+        "segmented_surface_class_counts": class_counts,
+        "segmented_surface_close_kernel": [close_w, close_h],
+        "segmented_surface_background_kernel": surface_kernel,
+    }
+
+
+def low_texture_plane_repair(
+    original_bgr: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Rebuild a smooth watermark band from rows immediately above and below."""
+    if det.roi_class not in {"plain_white", "near_white", "low_texture_background"}:
+        return None, None, 0.0, {"reason": "roi_not_low_texture_plane"}
+    gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    glyph = create_glyph_halo_mask(
+        canonical_ink_mask(),
+        b,
+        2,
+        1,
+        gray.shape,
+    )
+    ys, xs = np.where(glyph > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None, None, 0.0, {"reason": "empty_plane_glyph"}
+
+    tail = max(12, min(52, int(round(b["w"] * 0.22))))
+    target_h = max(14, min(22, int(ys.max()) - int(ys.min()) + 3))
+    center_y = int(round((int(ys.min()) + int(ys.max())) / 2.0))
+    x1 = max(0, int(b["x"]) - tail)
+    x2 = min(img_w, int(b["x"] + b["w"]) + tail)
+    y1 = max(4, center_y - target_h // 2)
+    y2 = min(img_h - 4, y1 + target_h)
+    y1 = max(4, y2 - target_h)
+    if x2 - x1 < 48 or y2 - y1 < 10:
+        return None, None, 0.0, {"reason": "plane_target_too_small"}
+
+    context = np.zeros_like(gray, dtype=np.uint8)
+    context[y1 - 4:y1 - 1, x1:x2] = 255
+    context[y2 + 1:y2 + 4, x1:x2] = 255
+    edge_density = float(np.mean(cv2.Canny(gray, 45, 130)[context > 0] > 0))
+    top_rows = np.median(original_bgr[y1 - 4:y1 - 1, x1:x2].astype(np.float32), axis=0)
+    bottom_rows = np.median(original_bgr[y2 + 1:y2 + 4, x1:x2].astype(np.float32), axis=0)
+    context_pixels = np.concatenate([top_rows, bottom_rows], axis=0)
+    context_std = float(np.std(context_pixels)) if context_pixels.size else 255.0
+    row_delta = float(np.mean(np.abs(top_rows - bottom_rows))) if context_pixels.size else 255.0
+    if context_pixels.shape[0] < 60 or edge_density > 0.055 or row_delta > 38.0:
+        return None, None, 0.0, {
+            "reason": "plane_context_not_smooth",
+            "plane_context_edge_density": edge_density,
+            "plane_context_std": context_std,
+            "plane_context_row_delta": row_delta,
+        }
+
+    repaired = original_bgr.copy()
+    top = top_rows
+    bottom = bottom_rows
+    top = cv2.GaussianBlur(top.reshape(1, x2 - x1, 3), (9, 1), 0).reshape(x2 - x1, 3)
+    bottom = cv2.GaussianBlur(bottom.reshape(1, x2 - x1, 3), (9, 1), 0).reshape(x2 - x1, 3)
+    for y in range(y1, y2):
+        weight = float(y - y1 + 1) / float(y2 - y1 + 1)
+        repaired[y, x1:x2] = np.uint8(np.clip(top * (1.0 - weight) + bottom * weight, 0, 255))
+
+    target_mask = _rect_mask(gray.shape, (x1, y1, x2, y2))
+    area = _mask_area(target_mask)
+    return repaired, target_mask, area, {
+        "operator": "low_texture_plane_repair",
+        "low_texture_plane_repair_used": True,
+        "plane_target_box": {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1},
+        "plane_context_edge_density": edge_density,
+        "plane_context_std": context_std,
+        "plane_context_row_delta": row_delta,
         "repair_mask_area_pct": area * 100,
     }
 
@@ -3577,8 +3772,9 @@ def detect_product_damage_v13(original: np.ndarray, candidate: np.ndarray, mask:
     orig_i = orig_gray.astype(np.int16)
     cand_i = cand_gray.astype(np.int16)
     dark_surface = orig_i < 110
+    bright_surface = orig_i > 180
     bright_blob = np.logical_and.reduce((changed > 0, dark_surface, cand_i > orig_i + 42))
-    dark_blob = np.logical_and(changed > 0, cand_i + 42 < orig_i)
+    dark_blob = np.logical_and.reduce((changed > 0, bright_surface, cand_i + 42 < orig_i))
     blob_score = float((np.count_nonzero(bright_blob) + np.count_nonzero(dark_blob)) / max(1, changed_count))
     changed_area_ratio = float(changed_count / max(1, np.count_nonzero(mask)))
     contour_break = max(0.0, 1.0 - edge_retention)
@@ -3894,6 +4090,49 @@ def clean_image(
             return 0.0
         return float(score_alpha_residual(candidate_bgr, mark_tuple, alpha_template))
 
+    def append_surface_candidate(
+        candidate_bgr: np.ndarray,
+        candidate_mask: np.ndarray,
+        candidate_area: float,
+        strategy: str,
+        extra: dict,
+        *,
+        area_weight: float,
+        preference: float = 0.0,
+    ) -> None:
+        cgray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+        sharpness_ratio = laplacian_var(cgray, candidate_mask) / max(
+            laplacian_var(gray, candidate_mask),
+            1e-6,
+        )
+        metrics = residual_quality_metrics(cgray, det, templates)
+        residual = metrics["residual_score"]
+        template_residual = metrics["template_residual_score"]
+        alpha_probe = alpha_probe_score(candidate_bgr)
+        cost = (
+            min(1.0, residual)
+            + min(1.0, template_residual) * 0.30
+            + alpha_probe * 0.80
+            + candidate_area * area_weight
+            + max(0.0, 0.14 - sharpness_ratio) * 0.24
+            - preference
+        )
+        candidates.append((
+            -cost,
+            residual,
+            template_residual,
+            sharpness_ratio,
+            candidate_area,
+            strategy,
+            candidate_bgr,
+            candidate_mask,
+            metrics,
+            {
+                "alpha_residual_probe_score": alpha_probe,
+                **extra,
+            },
+        ))
+
     alpha_allowed = (
         engine is not None
         and engine.alpha_available()
@@ -3955,6 +4194,43 @@ def clean_image(
             alpha_candidate_count += 1
             if alpha_candidate_count >= MAX_ALPHA_REPAIR_CANDIDATES:
                 break
+
+    if engine is not None and engine.alpha_available():
+        segmented_alignments = engine.align_alpha_to_mark_box(img, mark_tuple, roi_class=det.roi_class)
+        for idx, (aligned_alpha, aligned_bbox, alignment_score) in enumerate(segmented_alignments[:5]):
+            aligned_mask = (aligned_alpha >= 0.025).astype(np.uint8) * 255
+            aligned_mask = cv2.dilate(
+                aligned_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 3)),
+                iterations=1,
+            )
+            (
+                segmented_candidate,
+                segmented_mask,
+                segmented_area,
+                segmented_meta,
+            ) = segmented_nearest_surface_repair(img, aligned_mask, det)
+            if segmented_candidate is None or segmented_mask is None:
+                continue
+            append_surface_candidate(
+                segmented_candidate,
+                segmented_mask,
+                segmented_area,
+                f"sunsky_segmented_alpha_surface_{idx}",
+                {
+                    "segmented_surface_candidate": True,
+                    "segmented_surface_alignment_score": float(alignment_score),
+                    "segmented_surface_alignment_bbox": {
+                        "x": int(aligned_bbox[0]),
+                        "y": int(aligned_bbox[1]),
+                        "w": int(aligned_bbox[2]),
+                        "h": int(aligned_bbox[3]),
+                    },
+                    **segmented_meta,
+                },
+                area_weight=5.0 if risky_product_roi else 4.0,
+                preference=min(0.20, float(alignment_score) * 0.20),
+            )
 
     aligned_white_mask, white_alignment_meta = align_glyph_mask_from_white_evidence(img, gray, det)
     if aligned_white_mask is not None:
@@ -4089,6 +4365,24 @@ def clean_image(
                 },
             ))
 
+    plane_candidate, plane_mask, plane_area, plane_meta = low_texture_plane_repair(img, det)
+    if plane_candidate is not None and plane_mask is not None:
+        if first_mask is None:
+            first_mask = plane_mask
+            first_area = plane_area
+        append_surface_candidate(
+            plane_candidate,
+            plane_mask,
+            plane_area,
+            "low_texture_plane_repair",
+            {
+                "segmented_surface_candidate": True,
+                **plane_meta,
+            },
+            area_weight=3.0,
+            preference=0.32,
+        )
+
     for variant, pad_x, pad_y, dilate_px, radius, glyph in variants:
         mask, area = create_mask(gray, det, img=img, pad_x=pad_x, pad_y=pad_y, dilate_px=dilate_px, glyph=glyph)
         if mask is None:
@@ -4099,6 +4393,25 @@ def clean_image(
         area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
         if area > area_limit:
             continue
+        (
+            segmented_candidate,
+            segmented_mask,
+            segmented_area,
+            segmented_meta,
+        ) = segmented_nearest_surface_repair(img, mask, det)
+        if segmented_candidate is not None and segmented_mask is not None:
+            append_surface_candidate(
+                segmented_candidate,
+                segmented_mask,
+                segmented_area,
+                f"{variant}_segmented_surface",
+                {
+                    "segmented_surface_candidate": True,
+                    **segmented_meta,
+                },
+                area_weight=5.0 if risky_product_roi else 4.0,
+                preference=0.16 if risky_product_roi else 0.10,
+            )
         strip_candidate, strip_mask, strip_area, strip_meta = textured_panel_strip_clone_repair(
             img,
             gray,
@@ -4282,6 +4595,7 @@ def clean_image(
     candidates.sort(reverse=True, key=lambda item: item[0])
     selected = candidates[0]
     selected_eval: dict | None = None
+    best_failed_eval: tuple[float, tuple, str, dict] | None = None
     candidate_traces = []
     selected_candidate_id = "cand_00"
     evaluation_candidates = []
@@ -4294,6 +4608,12 @@ def clean_image(
         seen_candidate_keys.add(key)
         evaluation_candidates.append(candidate_tuple)
 
+    for cand in [
+        item
+        for item in candidates
+        if item[9].get("alpha_candidate") and "solved" in item[5]
+    ][:2]:
+        add_eval_candidate(cand)
     for cand in candidates[:4]:
         add_eval_candidate(cand)
     for cand in [
@@ -4301,6 +4621,12 @@ def clean_image(
         for item in candidates
         if item[9].get("white_evidence_candidate")
     ][:WHITE_EVIDENCE_EVAL_RESERVED_CANDIDATES]:
+        add_eval_candidate(cand)
+    for cand in [
+        item
+        for item in candidates
+        if item[9].get("segmented_surface_candidate")
+    ][:SEGMENTED_SURFACE_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate") and "solved" in item[5]][:ALPHA_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
@@ -4354,26 +4680,49 @@ def clean_image(
             "alpha_template_residual_after": round(float(calpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
             "reject_reasons": list(cgate_meta.get("reject_reasons") or []),
         })
+        failed_review_score = (
+            float(cmetrics["residual_score"])
+            + float(cmetrics["template_residual_score"]) * 0.35
+            + float(calpha_metrics.get("alpha_template_residual_after") or 0.0) * 0.55
+            + float(cdot_metrics.get("dot_chain_score") or 0.0) * 0.65
+            + float(cband_metrics.get("visible_band_score") or 0.0) * 1.50
+            + float(cproduct_metrics.get("product_blob_score") or 0.0) * 2.50
+            + (2.50 if cproduct_metrics.get("product_gate_fail") else 0.0)
+            + (1.75 if cband_metrics.get("band_gate_fail") else 0.0)
+            + (1.25 if cocr_meta.get("ocr_watermark") else 0.0)
+            + (0.75 if cdot_metrics.get("dot_chain_fail") else 0.0)
+            + carea * 3.0
+        )
+        failed_eval = {
+            "gray": cgray,
+            "metrics": cmetrics,
+            "post_count": cpost_count,
+            "ocr_meta": cocr_meta,
+            "dot_metrics": cdot_metrics,
+            "band_metrics": cband_metrics,
+            "product_metrics": cproduct_metrics,
+            "alpha_metrics": calpha_metrics,
+            "gate_meta": cgate_meta,
+        }
+        if best_failed_eval is None or failed_review_score < best_failed_eval[0]:
+            best_failed_eval = (failed_review_score, cand, trace_id, failed_eval)
         if cgate_meta["publish_ok"]:
             selected = cand
             selected_candidate_id = trace_id
-            selected_eval = {
-                "gray": cgray,
-                "metrics": cmetrics,
-                "post_count": cpost_count,
-                "ocr_meta": cocr_meta,
-                "dot_metrics": cdot_metrics,
-                "band_metrics": cband_metrics,
-                "product_metrics": cproduct_metrics,
-                "alpha_metrics": calpha_metrics,
-                "gate_meta": cgate_meta,
-            }
+            selected_eval = failed_eval
             break
+
+    if selected_eval is None and best_failed_eval is not None:
+        _, selected, selected_candidate_id, selected_eval = best_failed_eval
 
     _, residual, template_residual, ratio, area, name, best, mask, metrics, selected_extra = selected
 
     lama_reason = ""
-    if ENABLE_LAMA_ESCALATION and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
+    lama_safe_roi = (
+        det.roi_class in {"plain_white", "near_white", "low_texture_background", "simple_product_surface"}
+        and det.product_overlap < 0.58
+    )
+    if ENABLE_LAMA_ESCALATION and lama_safe_roi and residual >= LAMA_ESCALATION_RESIDUAL_MIN:
         lama_mask = mask
         lama_area = area
         selected_mask_too_small = (
@@ -4695,6 +5044,35 @@ def clean_image(
         ),
         "white_evidence_surface_fill": bool(selected_extra.get("white_evidence_surface_fill")),
         "white_evidence_median_kernel": int(selected_extra.get("white_evidence_median_kernel") or 0),
+        "segmented_surface_repair_used": bool(selected_extra.get("segmented_surface_repair_used")),
+        "segmented_surface_alignment_score": round(
+            float(selected_extra.get("segmented_surface_alignment_score") or 0.0),
+            4,
+        ),
+        "segmented_surface_alignment_bbox": selected_extra.get("segmented_surface_alignment_bbox") or {},
+        "segmented_surface_area_pct": round(
+            float(selected_extra.get("segmented_surface_area_pct") or 0.0),
+            3,
+        ),
+        "segmented_surface_filled_pixels": int(
+            selected_extra.get("segmented_surface_filled_pixels") or 0
+        ),
+        "segmented_surface_class_counts": selected_extra.get("segmented_surface_class_counts") or {},
+        "segmented_surface_close_kernel": selected_extra.get("segmented_surface_close_kernel") or [],
+        "segmented_surface_background_kernel": int(
+            selected_extra.get("segmented_surface_background_kernel") or 0
+        ),
+        "low_texture_plane_repair_used": bool(selected_extra.get("low_texture_plane_repair_used")),
+        "plane_target_box": selected_extra.get("plane_target_box") or {},
+        "plane_context_edge_density": round(
+            float(selected_extra.get("plane_context_edge_density") or 0.0),
+            4,
+        ),
+        "plane_context_std": round(float(selected_extra.get("plane_context_std") or 0.0), 4),
+        "plane_context_row_delta": round(
+            float(selected_extra.get("plane_context_row_delta") or 0.0),
+            4,
+        ),
         "solid_background_cover_used": bool(selected_extra.get("solid_background_cover_used")),
         "solid_block_cover_used": bool(selected_extra.get("solid_block_cover_used")),
         "solid_cover_target": selected_extra.get("solid_cover_target", ""),
