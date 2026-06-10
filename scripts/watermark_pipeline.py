@@ -35,6 +35,8 @@ from sunsky_alpha_engine import (
     FINAL_ALPHA_TEMPLATE_MAX,
     MIN_ALPHA_RESIDUAL_REDUCTION,
     SunskyAlphaEngine,
+    extract_polarity_aware_sunsky_mask,
+    imread_unicode,
     score_alpha_residual,
 )
 
@@ -120,7 +122,14 @@ ALPHA_EVAL_RESERVED_CANDIDATES = 8
 WHITE_EVIDENCE_EVAL_RESERVED_CANDIDATES = 6
 WHITE_EVIDENCE_ALIGNMENT_MIN = 0.58
 SEGMENTED_SURFACE_EVAL_RESERVED_CANDIDATES = 6
+SIBLING_CONSENSUS_EVAL_RESERVED_CANDIDATES = 4
 COMBINED_MASK_REVIEW_AREA = 0.035
+SIBLING_CONSENSUS_MAX_REFERENCES = 4
+SIBLING_CONSENSUS_MIN_MATCHES = 70
+SIBLING_CONSENSUS_MIN_INLIERS = 55
+SIBLING_CONSENSUS_MIN_INLIER_RATIO = 0.62
+SIBLING_CONSENSUS_CONTEXT_MEDIAN_MAX = 3.0
+SIBLING_CONSENSUS_CONTEXT_P90_MAX = 14.0
 MIN_TEXT_COMPONENTS = 4
 HIGH_CONTRAST_SPAN = 200.0
 REVIEW_CONTRAST_SPAN = 170.0
@@ -982,6 +991,317 @@ def low_texture_plane_repair(
         "plane_context_std": context_std,
         "plane_context_row_delta": row_delta,
         "repair_mask_area_pct": area * 100,
+    }
+
+
+def build_polarity_baseline_mask(
+    image_bgr: np.ndarray,
+    det: Detection,
+) -> tuple[np.ndarray | None, dict]:
+    """Locate the visible text baseline without trusting a tight glyph template."""
+    img_h, img_w = image_bgr.shape[:2]
+    b = det.mark_box
+    pad_x = max(10, int(round(b["w"] * 0.30)))
+    pad_y = max(8, int(round(b["h"] * 0.70)))
+    x1 = max(0, int(b["x"]) - pad_x)
+    x2 = min(img_w, int(b["x"] + b["w"]) + pad_x)
+    y1 = max(0, int(b["y"]) - pad_y)
+    y2 = min(img_h, int(b["y"] + b["h"]) + pad_y)
+    if x2 - x1 < 40 or y2 - y1 < 10:
+        return None, {"reason": "polarity_search_too_small"}
+
+    evidence = extract_polarity_aware_sunsky_mask(image_bgr[y1:y2, x1:x2])
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(evidence)
+    kept = np.zeros_like(evidence)
+    mark_center_y = float(b["y"] + b["h"] * 0.58 - y1)
+    y_tolerance = max(6.0, float(b["h"]) * 0.62)
+    max_component_h = max(5, int(round(b["h"] * 0.72)))
+    max_component_w = max(12, int(round(b["w"] * 0.42)))
+    component_count = 0
+    for idx in range(1, count):
+        cx, cy = centroids[idx]
+        _, _, cw, ch, area = stats[idx]
+        if area < 3 or ch > max_component_h or cw > max_component_w:
+            continue
+        if abs(float(cy) - mark_center_y) > y_tolerance:
+            continue
+        if cw > max(8, ch * 12):
+            continue
+        kept[labels == idx] = 255
+        component_count += 1
+
+    ys, xs = np.where(kept > 0)
+    if component_count < 4 or len(xs) < 18:
+        return None, {
+            "reason": "insufficient_polarity_components",
+            "polarity_component_count": component_count,
+        }
+    span = float(int(xs.max()) - int(xs.min()) + 1) / max(1.0, float(b["w"]))
+    if span < 0.42:
+        return None, {
+            "reason": "insufficient_polarity_span",
+            "polarity_component_count": component_count,
+            "polarity_horizontal_span": span,
+        }
+
+    kept = cv2.morphologyEx(
+        kept,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)),
+        iterations=1,
+    )
+    kept = cv2.dilate(
+        kept,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)),
+        iterations=1,
+    )
+    full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    full_mask[y1:y2, x1:x2] = kept
+    ys, xs = np.where(full_mask > 0)
+    bbox = {
+        "x": max(0, int(xs.min()) - 3),
+        "y": max(0, int(ys.min()) - 2),
+        "w": min(img_w, int(xs.max()) + 4) - max(0, int(xs.min()) - 3),
+        "h": min(img_h, int(ys.max()) + 3) - max(0, int(ys.min()) - 2),
+    }
+    return full_mask, {
+        "polarity_baseline_used": True,
+        "polarity_component_count": component_count,
+        "polarity_horizontal_span": span,
+        "polarity_baseline_bbox": bbox,
+    }
+
+
+def _same_family_sibling_paths(source_path: Path) -> list[Path]:
+    source_path = source_path.resolve()
+    family = re.sub(r"-(?:main|\d+)$", "", source_path.stem, flags=re.IGNORECASE)
+    if family == source_path.stem:
+        return []
+    siblings = []
+    for path in source_path.parent.glob(f"{family}-*"):
+        if path == source_path or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if re.sub(r"-(?:main|\d+)$", "", path.stem, flags=re.IGNORECASE) != family:
+            continue
+        siblings.append(path)
+    siblings.sort(key=lambda path: (path.stem.endswith("-main"), path.name))
+    return siblings
+
+
+def sibling_consensus_surface_repair(
+    original_bgr: np.ndarray,
+    det: Detection,
+    source_path: Path | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Use only geometrically identical sibling photos as watermark-free evidence.
+
+    Sibling images often contain the same watermark at a slightly different
+    sampling phase. After product-only feature alignment, extrema away from the
+    gray logo recover the underlying dark/light surface. Smooth white pixels are
+    filled directly from the nearest clean white context.
+    """
+    if source_path is None or not source_path.exists():
+        return None, None, 0.0, {"reason": "sibling_source_unavailable"}
+    sibling_paths = _same_family_sibling_paths(source_path)
+    if not sibling_paths:
+        return None, None, 0.0, {"reason": "no_same_family_siblings"}
+
+    polarity_mask, polarity_meta = build_polarity_baseline_mask(original_bgr, det)
+    if polarity_mask is None:
+        return None, None, 0.0, polarity_meta
+    bbox = polarity_meta["polarity_baseline_bbox"]
+    img_h, img_w = original_bgr.shape[:2]
+    line_x1 = max(0, int(bbox["x"]))
+    line_y1 = max(0, int(bbox["y"]))
+    line_x2 = min(img_w, line_x1 + int(bbox["w"]))
+    line_y2 = min(img_h, line_y1 + int(bbox["h"]))
+    if line_x2 - line_x1 < 40 or line_y2 - line_y1 < 6:
+        return None, polarity_mask, 0.0, {"reason": "sibling_consensus_line_too_small"}
+
+    target_gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+    feature_mask = np.full(target_gray.shape, 255, dtype=np.uint8)
+    feature_mask[
+        max(0, line_y1 - det.mark_box["h"]):min(img_h, line_y2 + det.mark_box["h"]),
+        max(0, line_x1 - 12):min(img_w, line_x2 + 12),
+    ] = 0
+    sift = cv2.SIFT_create(nfeatures=3000)
+    target_keypoints, target_desc = sift.detectAndCompute(target_gray, feature_mask)
+    if target_desc is None or len(target_keypoints) < SIBLING_CONSENSUS_MIN_MATCHES:
+        return None, polarity_mask, 0.0, {"reason": "insufficient_target_features"}
+
+    line_mask = np.zeros(target_gray.shape, dtype=np.uint8)
+    line_mask[line_y1:line_y2, line_x1:line_x2] = 255
+    context = np.zeros_like(line_mask)
+    context[
+        max(0, line_y1 - max(12, det.mark_box["h"])):min(
+            img_h,
+            line_y2 + max(12, det.mark_box["h"]),
+        ),
+        max(0, line_x1 - max(14, det.mark_box["w"] // 12)):min(
+            img_w,
+            line_x2 + max(14, det.mark_box["w"] // 12),
+        ),
+    ] = 255
+    context[line_mask > 0] = 0
+
+    aligned_frames = [original_bgr]
+    aligned_valid = [np.ones(target_gray.shape, dtype=bool)]
+    alignment_rows: list[dict] = []
+    matcher = cv2.BFMatcher()
+    for sibling_path in sibling_paths[:10]:
+        sibling = imread_unicode(sibling_path, cv2.IMREAD_COLOR)
+        if sibling is None or min(sibling.shape[:2]) < 40:
+            continue
+        sibling_gray = cv2.cvtColor(sibling, cv2.COLOR_BGR2GRAY)
+        sibling_keypoints, sibling_desc = sift.detectAndCompute(sibling_gray, None)
+        if sibling_desc is None:
+            continue
+        pairs = matcher.knnMatch(sibling_desc, target_desc, k=2)
+        good = [match for match, other in pairs if match.distance < 0.72 * other.distance]
+        if len(good) < SIBLING_CONSENSUS_MIN_MATCHES:
+            continue
+        src = np.float32([sibling_keypoints[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([target_keypoints[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        homography, inlier_mask = cv2.findHomography(src, dst, cv2.RANSAC, 2.5)
+        if homography is None or inlier_mask is None:
+            continue
+        inliers = int(np.count_nonzero(inlier_mask))
+        inlier_ratio = float(inliers) / max(1, len(good))
+        if (
+            inliers < SIBLING_CONSENSUS_MIN_INLIERS
+            or inlier_ratio < SIBLING_CONSENSUS_MIN_INLIER_RATIO
+        ):
+            continue
+        warped = cv2.warpPerspective(
+            sibling,
+            homography,
+            (img_w, img_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+        valid = cv2.warpPerspective(
+            np.full(sibling.shape[:2], 255, dtype=np.uint8),
+            homography,
+            (img_w, img_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+        ) > 250
+        diff = cv2.cvtColor(cv2.absdiff(original_bgr, warped), cv2.COLOR_BGR2GRAY)
+        context_values = diff[(context > 0) & valid]
+        if context_values.size < 80:
+            continue
+        context_median = float(np.median(context_values))
+        context_p90 = float(np.percentile(context_values, 90))
+        if (
+            context_median > SIBLING_CONSENSUS_CONTEXT_MEDIAN_MAX
+            or context_p90 > SIBLING_CONSENSUS_CONTEXT_P90_MAX
+        ):
+            continue
+        aligned_frames.append(warped)
+        aligned_valid.append(valid)
+        alignment_rows.append({
+            "file": sibling_path.name,
+            "matches": len(good),
+            "inliers": inliers,
+            "inlier_ratio": inlier_ratio,
+            "context_median": context_median,
+            "context_p90": context_p90,
+        })
+        if len(alignment_rows) >= SIBLING_CONSENSUS_MAX_REFERENCES:
+            break
+
+    if not alignment_rows:
+        return None, polarity_mask, 0.0, {
+            "reason": "no_high_confidence_sibling_alignment",
+            **polarity_meta,
+        }
+
+    frame_stack = np.stack(aligned_frames)
+    luma_stack = np.stack([
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        for frame in aligned_frames
+    ])
+    valid_stack = np.stack(aligned_valid)
+    yy, xx = np.indices(target_gray.shape)
+    max_indices = np.argmax(np.where(valid_stack, luma_stack, -1), axis=0)
+    min_indices = np.argmin(np.where(valid_stack, luma_stack, 256), axis=0)
+    max_pixels = frame_stack[max_indices, yy, xx]
+    min_pixels = frame_stack[min_indices, yy, xx]
+
+    surface_kernel = max(15, min(35, (int(round(det.mark_box["h"] * 0.65)) | 1)))
+    surface_bgr = cv2.medianBlur(original_bgr, surface_kernel)
+    surface_gray = cv2.cvtColor(surface_bgr, cv2.COLOR_BGR2GRAY)
+    selected_pixels = np.where(
+        (surface_gray >= 180)[:, :, None],
+        max_pixels,
+        min_pixels,
+    )
+    valid_count = np.sum(valid_stack, axis=0)
+    luma_range = np.max(
+        np.where(valid_stack, luma_stack, 0),
+        axis=0,
+    ) - np.min(
+        np.where(valid_stack, luma_stack, 255),
+        axis=0,
+    )
+    repair_line = line_mask > 0
+    candidate = original_bgr.copy()
+    consensus_pixels = repair_line & (valid_count >= 2) & (luma_range >= 2)
+    candidate[consensus_pixels] = selected_pixels[consensus_pixels]
+
+    hsv = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2HSV)
+    white_target = (
+        repair_line
+        & (surface_gray > 225)
+        & (target_gray > 155)
+        & (hsv[:, :, 1] < 64)
+    )
+    white_ring = (context > 0) & (target_gray > 235) & (hsv[:, :, 1] < 52)
+    white_samples = original_bgr[white_ring]
+    white_fill_pixels = 0
+    if white_samples.size:
+        white_fill = np.median(white_samples.reshape(-1, 3), axis=0).astype(np.uint8)
+        candidate[white_target] = white_fill
+        white_fill_pixels = int(np.count_nonzero(white_target))
+
+    changed_gray = cv2.cvtColor(cv2.absdiff(original_bgr, candidate), cv2.COLOR_BGR2GRAY)
+    effective_mask = ((changed_gray > 2) & repair_line).astype(np.uint8) * 255
+    effective_mask = cv2.morphologyEx(
+        effective_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    candidate[effective_mask == 0] = original_bgr[effective_mask == 0]
+    changed_pixels = int(np.count_nonzero(effective_mask))
+    area = _mask_area(effective_mask)
+    if changed_pixels < 24 or area > COMBINED_MASK_REVIEW_AREA:
+        return None, effective_mask, area, {
+            "reason": "sibling_consensus_changed_area_limit",
+            "sibling_consensus_changed_pixels": changed_pixels,
+            "sibling_consensus_area_pct": area * 100,
+            **polarity_meta,
+        }
+    best_alignment = max(
+        float(row["inlier_ratio"]) * max(0.0, 1.0 - float(row["context_p90"]) / 255.0)
+        for row in alignment_rows
+    )
+    return candidate, effective_mask, area, {
+        "operator": "same_family_sibling_consensus",
+        "sibling_consensus_used": True,
+        "sibling_consensus_references": alignment_rows,
+        "sibling_consensus_reference_count": len(alignment_rows),
+        "sibling_consensus_similarity": best_alignment,
+        "sibling_consensus_target_box": {
+            "x": line_x1,
+            "y": line_y1,
+            "w": line_x2 - line_x1,
+            "h": line_y2 - line_y1,
+        },
+        "sibling_consensus_white_fill_pixels": white_fill_pixels,
+        "sibling_consensus_changed_pixels": changed_pixels,
+        "sibling_consensus_area_pct": area * 100,
+        **polarity_meta,
     }
 
 
@@ -4046,6 +4366,7 @@ def clean_image(
     det: Detection,
     templates: list[TemplateSpec] | None = None,
     ocr_reader=None,
+    source_path: Path | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
     high_contrast_mask = ENABLE_HIGH_CONTRAST_BOX_MASK and det.contrast_span >= REVIEW_CONTRAST_SPAN
     risky_product_roi = (
@@ -4383,6 +4704,29 @@ def clean_image(
             preference=0.32,
         )
 
+    (
+        sibling_candidate,
+        sibling_mask,
+        sibling_area,
+        sibling_meta,
+    ) = sibling_consensus_surface_repair(img, det, source_path)
+    if sibling_candidate is not None and sibling_mask is not None:
+        if first_mask is None:
+            first_mask = sibling_mask
+            first_area = sibling_area
+        append_surface_candidate(
+            sibling_candidate,
+            sibling_mask,
+            sibling_area,
+            "same_family_sibling_consensus",
+            {
+                "sibling_consensus_candidate": True,
+                **sibling_meta,
+            },
+            area_weight=3.2 if risky_product_roi else 2.8,
+            preference=0.34,
+        )
+
     for variant, pad_x, pad_y, dilate_px, radius, glyph in variants:
         mask, area = create_mask(gray, det, img=img, pad_x=pad_x, pad_y=pad_y, dilate_px=dilate_px, glyph=glyph)
         if mask is None:
@@ -4628,6 +4972,12 @@ def clean_image(
         if item[9].get("segmented_surface_candidate")
     ][:SEGMENTED_SURFACE_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
+    for cand in [
+        item
+        for item in candidates
+        if item[9].get("sibling_consensus_candidate")
+    ][:SIBLING_CONSENSUS_EVAL_RESERVED_CANDIDATES]:
+        add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate") and "solved" in item[5]][:ALPHA_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate")][:ALPHA_EVAL_RESERVED_CANDIDATES]:
@@ -4693,6 +5043,14 @@ def clean_image(
             + (0.75 if cdot_metrics.get("dot_chain_fail") else 0.0)
             + carea * 3.0
         )
+        if (
+            cextra.get("sibling_consensus_candidate")
+            and float(cextra.get("sibling_consensus_similarity") or 0.0) >= 0.70
+            and not cband_metrics.get("band_gate_fail")
+        ):
+            # This only chooses the most useful failed-QA preview. It does not
+            # change publish_ok or bypass the product-damage gate.
+            failed_review_score -= 0.90
         failed_eval = {
             "gray": cgray,
             "metrics": cmetrics,
@@ -5073,6 +5431,29 @@ def clean_image(
             float(selected_extra.get("plane_context_row_delta") or 0.0),
             4,
         ),
+        "sibling_consensus_used": bool(selected_extra.get("sibling_consensus_used")),
+        "sibling_consensus_reference_count": int(
+            selected_extra.get("sibling_consensus_reference_count") or 0
+        ),
+        "sibling_consensus_similarity": round(
+            float(selected_extra.get("sibling_consensus_similarity") or 0.0),
+            4,
+        ),
+        "sibling_consensus_target_box": selected_extra.get("sibling_consensus_target_box") or {},
+        "sibling_consensus_white_fill_pixels": int(
+            selected_extra.get("sibling_consensus_white_fill_pixels") or 0
+        ),
+        "sibling_consensus_changed_pixels": int(
+            selected_extra.get("sibling_consensus_changed_pixels") or 0
+        ),
+        "sibling_consensus_references": selected_extra.get("sibling_consensus_references") or [],
+        "polarity_baseline_used": bool(selected_extra.get("polarity_baseline_used")),
+        "polarity_component_count": int(selected_extra.get("polarity_component_count") or 0),
+        "polarity_horizontal_span": round(
+            float(selected_extra.get("polarity_horizontal_span") or 0.0),
+            4,
+        ),
+        "polarity_baseline_bbox": selected_extra.get("polarity_baseline_bbox") or {},
         "solid_background_cover_used": bool(selected_extra.get("solid_background_cover_used")),
         "solid_block_cover_used": bool(selected_extra.get("solid_block_cover_used")),
         "solid_cover_target": selected_extra.get("solid_cover_target", ""),
@@ -5117,6 +5498,7 @@ def clean_all_detections(
     detections: list[Detection],
     templates: list[TemplateSpec] | None = None,
     ocr_reader=None,
+    source_path: Path | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
     current = img.copy()
     combined_mask = np.zeros(gray.shape[:2], dtype=np.uint8)
@@ -5126,7 +5508,14 @@ def clean_all_detections(
 
     for det in detections:
         current_gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
-        cleaned, mask, meta = clean_image(current, current_gray, det, templates, ocr_reader=ocr_reader)
+        cleaned, mask, meta = clean_image(
+            current,
+            current_gray,
+            det,
+            templates,
+            ocr_reader=ocr_reader,
+            source_path=source_path,
+        )
         detail = {**meta, "detection": det.to_json()}
         details.append(detail)
         statuses.append(meta["status"])
@@ -5286,6 +5675,51 @@ def clean_all_detections(
         "alpha_template_residual_after": round(max(alpha_after_scores), 4) if alpha_after_scores else 0.0,
         "alpha_residual_reduction": round(max(alpha_reductions), 4) if alpha_reductions else 0.0,
         "thin_residual_inpaint": any(bool(item.get("thin_residual_inpaint")) for item in details),
+        "sibling_consensus_used": any(bool(item.get("sibling_consensus_used")) for item in details),
+        "sibling_consensus_reference_count": max(
+            [
+                int(item.get("sibling_consensus_reference_count") or 0)
+                for item in details
+                if isinstance(item.get("sibling_consensus_reference_count"), int)
+            ],
+            default=0,
+        ),
+        "sibling_consensus_similarity": round(
+            max(
+                [
+                    float(item.get("sibling_consensus_similarity") or 0.0)
+                    for item in details
+                    if isinstance(item.get("sibling_consensus_similarity"), (int, float))
+                ],
+                default=0.0,
+            ),
+            4,
+        ),
+        "sibling_consensus_target_box": next(
+            (
+                item.get("sibling_consensus_target_box")
+                for item in details
+                if item.get("sibling_consensus_target_box")
+            ),
+            {},
+        ),
+        "sibling_consensus_references": next(
+            (
+                item.get("sibling_consensus_references")
+                for item in details
+                if item.get("sibling_consensus_references")
+            ),
+            [],
+        ),
+        "polarity_baseline_used": any(bool(item.get("polarity_baseline_used")) for item in details),
+        "polarity_baseline_bbox": next(
+            (
+                item.get("polarity_baseline_bbox")
+                for item in details
+                if item.get("polarity_baseline_bbox")
+            ),
+            {},
+        ),
         "solid_background_cover_used": any(bool(item.get("solid_background_cover_used")) for item in details),
         "solid_block_cover_used": any(bool(item.get("solid_block_cover_used")) for item in details),
         "solid_cover_target": ",".join(dict.fromkeys(solid_cover_targets)),
@@ -5828,7 +6262,14 @@ def process_file(
             entry["review_diff"] = f"diffs/{path.name}"
         return entry
     targets = cleaning_targets(detections)
-    cleaned, mask, meta = clean_all_detections(img, gray, targets, templates, ocr_reader=ocr_reader)
+    cleaned, mask, meta = clean_all_detections(
+        img,
+        gray,
+        targets,
+        templates,
+        ocr_reader=ocr_reader,
+        source_path=path,
+    )
     meta["detected_count"] = len(detections)
     entry = {
         "file": path.name,

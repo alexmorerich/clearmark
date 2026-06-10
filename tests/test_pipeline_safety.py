@@ -262,6 +262,142 @@ def test_white_evidence_alignment_is_safe_noop_without_white_glyph_evidence() ->
     assert meta["reason"] == "insufficient_white_glyph_evidence"
 
 
+def test_sibling_consensus_removes_shifted_mark_without_full_box_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    rng = np.random.default_rng(7)
+    clean = np.full((360, 640, 3), 250, np.uint8)
+    cv2.rectangle(clean, (80, 130), (470, 245), (30, 31, 33), -1)
+    cv2.circle(clean, (145, 185), 38, (15, 16, 18), 4)
+    cv2.rectangle(clean, (390, 145), (520, 220), (238, 240, 242), -1)
+    for _ in range(180):
+        x = int(rng.integers(20, 620))
+        y = int(rng.integers(20, 340))
+        color = int(rng.integers(35, 225))
+        cv2.circle(clean, (x, y), int(rng.integers(1, 3)), (color, color, color), -1)
+
+    ink = pipeline.canonical_ink_mask()
+
+    def overlay_at(x: int) -> np.ndarray:
+        out = clean.astype(np.float32)
+        glyph = cv2.resize(ink, (270, 28), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        alpha = glyph * 0.46
+        crop = out[174:202, x:x + 270]
+        crop[:] = crop * (1.0 - alpha[:, :, None]) + 184.0 * alpha[:, :, None]
+        return np.uint8(np.clip(out, 0, 255))
+
+    target = overlay_at(150)
+    sibling = overlay_at(156)
+    target_path = tmp_path / "synthetic-part-1.png"
+    sibling_path = tmp_path / "synthetic-part-2.png"
+    cv2.imwrite(str(target_path), target)
+    cv2.imwrite(str(sibling_path), sibling)
+    det = pipeline.Detection(
+        x=138,
+        y=166,
+        w=300,
+        h=45,
+        score=0.96,
+        verify_score=0.94,
+        template="ocr:sunsky-online.com",
+        scale=1.0,
+        mark_box={"x": 138, "y": 166, "w": 300, "h": 45},
+        mask_area_pct=0.8,
+        text_score=0.96,
+        text_components=18,
+        confidence=0.97,
+        ocr_watermark_score=0.98,
+        roi_class="dark_product_surface",
+        product_overlap=0.65,
+    )
+    baseline_mask = np.zeros(target.shape[:2], np.uint8)
+    baseline_mask[171:207, 145:427] = 255
+    monkeypatch.setattr(
+        pipeline,
+        "build_polarity_baseline_mask",
+        lambda *args, **kwargs: (
+            baseline_mask,
+            {
+                "polarity_baseline_used": True,
+                "polarity_component_count": 18,
+                "polarity_horizontal_span": 0.94,
+                "polarity_baseline_bbox": {"x": 145, "y": 171, "w": 282, "h": 36},
+            },
+        ),
+    )
+    monkeypatch.setattr(pipeline, "SIBLING_CONSENSUS_MIN_MATCHES", 15)
+    monkeypatch.setattr(pipeline, "SIBLING_CONSENSUS_MIN_INLIERS", 12)
+
+    repaired, repair_mask, area, meta = pipeline.sibling_consensus_surface_repair(
+        target,
+        det,
+        target_path,
+    )
+
+    assert repaired is not None
+    assert repair_mask is not None
+    assert meta["sibling_consensus_used"] is True
+    assert meta["sibling_consensus_reference_count"] == 1
+    assert 0.0 < area < pipeline.COMBINED_MASK_REVIEW_AREA
+    expected_mask = np.zeros(target.shape[:2], np.uint8)
+    expected_mask[174:202, 150:420] = 255
+    before_error = np.mean(cv2.absdiff(target, clean)[expected_mask > 0])
+    after_error = np.mean(cv2.absdiff(repaired, clean)[expected_mask > 0])
+    assert after_error < before_error * 0.45
+    changed = cv2.cvtColor(cv2.absdiff(target, repaired), cv2.COLOR_BGR2GRAY)
+    assert int(np.count_nonzero(changed[repair_mask == 0])) == 0
+
+
+def test_sibling_consensus_rejects_unrelated_family_image(tmp_path: Path) -> None:
+    target = np.full((240, 360, 3), 245, np.uint8)
+    cv2.putText(
+        target,
+        "sunsky-online.com",
+        (60, 125),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (180, 180, 180),
+        2,
+        cv2.LINE_AA,
+    )
+    unrelated = np.random.default_rng(11).integers(0, 255, target.shape, dtype=np.uint8)
+    target_path = tmp_path / "unrelated-part-1.png"
+    cv2.imwrite(str(target_path), target)
+    cv2.imwrite(str(tmp_path / "unrelated-part-2.png"), unrelated)
+    det = pipeline.Detection(
+        x=50,
+        y=96,
+        w=240,
+        h=42,
+        score=0.94,
+        verify_score=0.92,
+        template="ocr:sunsky-online.com",
+        scale=1.0,
+        mark_box={"x": 50, "y": 96, "w": 240, "h": 42},
+        mask_area_pct=0.8,
+        text_score=0.95,
+        text_components=16,
+        confidence=0.96,
+        ocr_watermark_score=0.97,
+        roi_class="near_white",
+    )
+
+    repaired, _, _, meta = pipeline.sibling_consensus_surface_repair(
+        target,
+        det,
+        target_path,
+    )
+
+    assert repaired is None
+    assert meta["reason"] in {
+        "insufficient_polarity_components",
+        "insufficient_polarity_span",
+        "insufficient_target_features",
+        "no_high_confidence_sibling_alignment",
+    }
+
+
 def test_residual_second_pass_uses_roi_specific_repairs(monkeypatch) -> None:
     image = np.full((120, 220, 3), 58, np.uint8)
     cv2.putText(image, "sunsky-online.com", (36, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (138, 138, 138), 1, cv2.LINE_AA)

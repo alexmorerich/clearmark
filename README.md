@@ -261,6 +261,41 @@ Manifest evidence includes:
 }
 ```
 
+### Same-Family Sibling Consensus
+
+Some product families contain several photographs of the same physical layout, for example `part-1.jpg`, `part-4.jpg`, and `part-main.jpg`. When those siblings are geometrically identical but their compressed Sunsky overlay lands at a slightly different sampling phase, ClearMark can use them as independent surface evidence.
+
+`sibling_consensus_surface_repair()` is deliberately strict:
+
+- the filename must belong to the same numbered or `main` family;
+- SIFT alignment excludes the confirmed watermark line from target feature detection;
+- at least 70 descriptor matches, 55 RANSAC inliers, and a 0.62 inlier ratio are required;
+- the aligned context outside the watermark must have median error at most 3 and 90th-percentile error at most 14;
+- unrelated angles, crops, and product variants are rejected as a safe no-op.
+
+The repair does not copy a sibling rectangle. `build_polarity_baseline_mask()` first finds the actual visible horizontal text baseline, including tails missed by a tight canonical template. Inside that confirmed line only, aligned sibling pixels are compared:
+
+- on dark product surfaces, the darkest valid aligned sample is preferred because the gray watermark raises luma;
+- on light surfaces, the brightest valid aligned sample is preferred because the watermark lowers luma;
+- on confirmed smooth white pixels, the nearest clean white context is written directly;
+- pixels with no meaningful sibling disagreement remain untouched.
+
+The effective mask is derived from pixels that actually changed, and every pixel outside that mask is restored byte-for-byte from the source. The candidate has a reserved gate-evaluation slot, but it still cannot enter `cleaned/` unless OCR, detector, residual, dot-chain, visible-band, product-damage, template, and alpha-template checks all pass.
+
+Manifest evidence includes:
+
+```json
+{
+  "sibling_consensus_used": true,
+  "sibling_consensus_reference_count": 2,
+  "sibling_consensus_similarity": 0.0,
+  "sibling_consensus_target_box": {"x": 0, "y": 0, "w": 0, "h": 0},
+  "sibling_consensus_references": [],
+  "polarity_baseline_used": true,
+  "polarity_baseline_bbox": {"x": 0, "y": 0, "w": 0, "h": 0}
+}
+```
+
 ### Low-Texture Column-Plane Reconstruction
 
 For a smooth LCD, digitizer, white card, or other low-texture plane, a glyph-only inpaint can leave readable dots and halos. `low_texture_plane_repair()` reconstructs the confirmed text band from the nearest rows immediately above and below it.
@@ -443,6 +478,12 @@ Each processed image records diagnostic fields such as:
   "plane_target_box": {},
   "plane_context_edge_density": 0.0,
   "plane_context_row_delta": 0.0,
+  "sibling_consensus_used": false,
+  "sibling_consensus_reference_count": 0,
+  "sibling_consensus_similarity": 0.0,
+  "sibling_consensus_target_box": {},
+  "polarity_baseline_used": false,
+  "polarity_baseline_bbox": {},
   "solid_background_cover_used": false,
   "solid_cover_target": "",
   "solid_cover_area_pct": 0.0,
