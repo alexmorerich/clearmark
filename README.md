@@ -40,6 +40,7 @@ inventory images
 -> generate repair candidates
    -> white-background glyph-evidence alignment
    -> same-surface direct fill for aligned glyphs
+   -> expanded-glyph local median reconstruction for cropped OCR boxes
    -> segmented nearest-surface reconstruction for mixed white/dark/color lines
    -> low-texture column-plane reconstruction for screens and smooth panels
    -> Sunsky reverse-alpha candidates
@@ -261,6 +262,37 @@ Manifest evidence includes:
 }
 ```
 
+### Expanded-Glyph Local Median Reconstruction
+
+OCR can correctly identify Sunsky while returning only the center of the domain. A tight mask then removes `sky-online` but leaves a readable `sun` or `.com` tail. `expanded_glyph_local_median_surface_repair()` handles this failure without turning the OCR box into a broad cover rectangle.
+
+The operator:
+
+- requires OCR-confirmed Sunsky evidence or equivalent high-confidence detection;
+- compares the OCR box with the canonical Sunsky aspect ratio;
+- expands left and right only when the OCR box is visibly cropped;
+- scales the canonical glyph mask into that expanded line;
+- unions it with the observed glyph seed and adds a small anti-alias halo;
+- replaces only those glyph-shaped pixels with a large local median surface model;
+- leaves every pixel outside the returned repair mask byte-for-byte unchanged;
+- rejects masks that become too dense, too large, or insufficiently glyph-shaped.
+
+For a complete OCR line, expansion is clamped to a small dilation around the observed mask. For a cropped line, the wider canonical footprint recovers missing tails while preserving spaces between letters. The candidate has reserved final-gate evaluation slots, but residual, OCR, dot-chain, visible-band, alpha-template, and product-damage checks remain unchanged.
+
+Manifest evidence includes:
+
+```json
+{
+  "expanded_glyph_surface_used": true,
+  "expanded_glyph_area_pct": 0.0,
+  "expanded_glyph_seed_area_pct": 0.0,
+  "expanded_glyph_fill_ratio": 0.0,
+  "expanded_glyph_median_kernel": 0,
+  "expanded_glyph_cropped_ocr_box": false,
+  "expanded_glyph_box": {"x": 0, "y": 0, "w": 0, "h": 0}
+}
+```
+
 ### Same-Family Sibling Consensus
 
 Some product families contain several photographs of the same physical layout, for example `part-1.jpg`, `part-4.jpg`, and `part-main.jpg`. When those siblings are geometrically identical but their compressed Sunsky overlay lands at a slightly different sampling phase, ClearMark can use them as independent surface evidence.
@@ -378,6 +410,8 @@ No inpaint method can bypass OCR, dot-chain, product-damage, visible-band, or al
 
 When no candidate passes, `attempts/` still needs to show the safest useful review image. ClearMark evaluates failed candidates with the complete QA metrics and prefers lower product damage, lower band visibility, lower residual evidence, and smaller changed area. This affects only the failed preview; it never converts a failed result into `cleaned/`.
 
+No strategy receives a fixed failed-preview bonus. In particular, a same-family sibling candidate cannot displace a visibly cleaner solid-fill or surface-model candidate merely because sibling alignment succeeded. Reserved evaluation slots ensure each repair family reaches QA; the shared evidence score decides which failed attempt is shown.
+
 ## Quality Review Methods And Criteria
 
 ClearMark keeps the final publish gate strict. The patch adds better candidates; it does not loosen approval thresholds to force more `cleaned/` outputs.
@@ -474,6 +508,13 @@ Each processed image records diagnostic fields such as:
   "segmented_surface_area_pct": 0.0,
   "segmented_surface_filled_pixels": 0,
   "segmented_surface_class_counts": {},
+  "expanded_glyph_surface_used": false,
+  "expanded_glyph_area_pct": 0.0,
+  "expanded_glyph_seed_area_pct": 0.0,
+  "expanded_glyph_fill_ratio": 0.0,
+  "expanded_glyph_median_kernel": 0,
+  "expanded_glyph_cropped_ocr_box": false,
+  "expanded_glyph_box": {},
   "low_texture_plane_repair_used": false,
   "plane_target_box": {},
   "plane_context_edge_density": 0.0,

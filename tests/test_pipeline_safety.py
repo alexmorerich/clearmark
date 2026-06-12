@@ -866,3 +866,203 @@ def test_low_texture_plane_repair_reconstructs_smooth_screen() -> None:
     assert after_error < before_error * 0.20
     outside_change = cv2.cvtColor(cv2.absdiff(image, repaired), cv2.COLOR_BGR2GRAY)
     assert int(np.count_nonzero(outside_change[repair_mask == 0])) == 0
+
+
+def test_expanded_glyph_repair_recovers_tails_outside_cropped_ocr_box() -> None:
+    clean = np.full((240, 520, 3), 246, np.uint8)
+    target_x, target_y, target_w, target_h = 110, 104, 280, 24
+    glyph = cv2.resize(
+        pipeline.canonical_ink_mask(),
+        (target_w, target_h),
+        interpolation=cv2.INTER_AREA,
+    )
+    alpha = glyph.astype(np.float32) / 255.0 * 0.46
+    image = clean.astype(np.float32)
+    crop = image[target_y:target_y + target_h, target_x:target_x + target_w]
+    crop[:] = crop * (1.0 - alpha[:, :, None]) + 178.0 * alpha[:, :, None]
+    image = np.uint8(np.clip(image, 0, 255))
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    cropped_x, cropped_w = 150, 200
+    full_glyph_mask = np.zeros(gray.shape, np.uint8)
+    full_glyph_mask[target_y:target_y + target_h, target_x:target_x + target_w] = (
+        glyph >= 18
+    ).astype(np.uint8) * 255
+    cropped_mask = full_glyph_mask.copy()
+    cropped_mask[:, :cropped_x] = 0
+    cropped_mask[:, cropped_x + cropped_w:] = 0
+    det = pipeline.Detection(
+        x=cropped_x,
+        y=98,
+        w=cropped_w,
+        h=36,
+        score=0.94,
+        verify_score=0.92,
+        template="ocr:crop:sunsky-online.com",
+        scale=1.0,
+        mark_box={"x": cropped_x, "y": 98, "w": cropped_w, "h": 36},
+        mask_area_pct=pipeline._mask_area(cropped_mask) * 100,
+        text_score=0.95,
+        text_components=14,
+        confidence=0.96,
+        ocr_watermark_score=0.95,
+        roi_class="plain_white",
+    )
+
+    repaired, repair_mask, area, _ = pipeline.expanded_glyph_local_median_surface_repair(
+        image,
+        gray,
+        cropped_mask,
+        det,
+        risky=False,
+    )
+
+    assert repaired is not None
+    assert repair_mask is not None
+    assert area > pipeline._mask_area(cropped_mask)
+    left_tail = (full_glyph_mask > 0) & (np.indices(gray.shape)[1] < cropped_x)
+    right_tail = (full_glyph_mask > 0) & (
+        np.indices(gray.shape)[1] >= cropped_x + cropped_w
+    )
+    assert int(np.count_nonzero(left_tail)) >= 20
+    assert int(np.count_nonzero(right_tail)) >= 20
+    assert np.count_nonzero((repair_mask > 0) & left_tail) >= np.count_nonzero(left_tail) * 0.55
+    assert np.count_nonzero((repair_mask > 0) & right_tail) >= np.count_nonzero(right_tail) * 0.55
+    before_tail_error = float(
+        np.mean(cv2.absdiff(image, clean)[left_tail | right_tail])
+    )
+    after_tail_error = float(
+        np.mean(cv2.absdiff(repaired, clean)[left_tail | right_tail])
+    )
+    assert after_tail_error < before_tail_error * 0.55
+
+
+def test_expanded_glyph_repair_preserves_mixed_surfaces_without_rectangular_band() -> None:
+    clean = np.full((260, 560, 3), 246, np.uint8)
+    clean[:, :280] = (34, 34, 34)
+    target_x, target_y, target_w, target_h = 112, 116, 336, 28
+    glyph = cv2.resize(
+        pipeline.canonical_ink_mask(),
+        (target_w, target_h),
+        interpolation=cv2.INTER_AREA,
+    )
+    alpha = glyph.astype(np.float32) / 255.0 * 0.44
+    image = clean.astype(np.float32)
+    crop = image[target_y:target_y + target_h, target_x:target_x + target_w]
+    crop[:] = crop * (1.0 - alpha[:, :, None]) + 180.0 * alpha[:, :, None]
+    image = np.uint8(np.clip(image, 0, 255))
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    glyph_mask = np.zeros(gray.shape, np.uint8)
+    glyph_mask[target_y:target_y + target_h, target_x:target_x + target_w] = (
+        glyph >= 16
+    ).astype(np.uint8) * 255
+    det = pipeline.Detection(
+        x=104,
+        y=106,
+        w=352,
+        h=48,
+        score=0.95,
+        verify_score=0.93,
+        template="ocr:sunsky-online.com",
+        scale=1.0,
+        mark_box={"x": 104, "y": 106, "w": 352, "h": 48},
+        mask_area_pct=pipeline._mask_area(glyph_mask) * 100,
+        text_score=0.96,
+        text_components=16,
+        confidence=0.97,
+        ocr_watermark_score=0.96,
+        roi_class="dark_product_surface",
+        product_overlap=0.55,
+    )
+
+    repaired, repair_mask, _, _ = pipeline.expanded_glyph_local_median_surface_repair(
+        image,
+        gray,
+        glyph_mask,
+        det,
+        risky=True,
+    )
+
+    assert repaired is not None
+    assert repair_mask is not None
+    changed = cv2.cvtColor(cv2.absdiff(image, repaired), cv2.COLOR_BGR2GRAY) > 2
+    assert int(np.count_nonzero(changed)) > 0
+    assert int(np.count_nonzero(changed & (repair_mask == 0))) == 0
+    glyph_halo = cv2.dilate(
+        glyph_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 5)),
+        iterations=1,
+    )
+    assert int(np.count_nonzero(changed & (glyph_halo == 0))) == 0
+    ys, xs = np.where(changed)
+    changed_box_area = (int(xs.max()) - int(xs.min()) + 1) * (
+        int(ys.max()) - int(ys.min()) + 1
+    )
+    assert np.count_nonzero(changed) / changed_box_area < 0.48
+    before_error = float(np.mean(cv2.absdiff(image, clean)[glyph_mask > 0]))
+    after_error = float(np.mean(cv2.absdiff(repaired, clean)[glyph_mask > 0]))
+    assert after_error < before_error * 0.65
+
+
+def test_expanded_glyph_repair_rejects_unconfirmed_low_confidence_detection() -> None:
+    image = np.full((180, 360, 3), 242, np.uint8)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask = np.zeros(gray.shape, np.uint8)
+    mask[82:94, 116:244] = 255
+    det = pipeline.Detection(
+        x=108,
+        y=76,
+        w=144,
+        h=26,
+        score=0.56,
+        verify_score=0.42,
+        template="prior:text_band",
+        scale=1.0,
+        mark_box={"x": 108, "y": 76, "w": 144, "h": 26},
+        mask_area_pct=pipeline._mask_area(mask) * 100,
+        text_score=0.48,
+        text_components=4,
+        confidence=0.55,
+        ocr_watermark_score=0.0,
+        roi_class="near_white",
+    )
+
+    repaired, repair_mask, area, meta = pipeline.expanded_glyph_local_median_surface_repair(
+        image,
+        gray,
+        mask,
+        det,
+        risky=False,
+    )
+
+    assert repaired is None
+    assert repair_mask is None
+    assert area == 0.0
+    assert meta.get("reason")
+
+
+def test_failed_preview_has_no_sibling_strategy_bonus() -> None:
+    safe = {
+        "dot_chain_score": 0.30,
+        "dot_chain_fail": True,
+        "visible_band_score": 0.02,
+        "band_gate_fail": False,
+        "product_blob_score": 0.04,
+        "product_gate_fail": False,
+    }
+    solid_score = pipeline.failed_candidate_review_score(
+        -0.42,
+        {"ocr_watermark": False},
+        safe,
+        safe,
+        safe,
+    )
+    sibling_score = pipeline.failed_candidate_review_score(
+        -0.67,
+        {"ocr_watermark": False},
+        safe,
+        safe,
+        safe,
+    )
+
+    assert solid_score < sibling_score

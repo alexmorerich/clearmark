@@ -123,6 +123,7 @@ WHITE_EVIDENCE_EVAL_RESERVED_CANDIDATES = 6
 WHITE_EVIDENCE_ALIGNMENT_MIN = 0.58
 SEGMENTED_SURFACE_EVAL_RESERVED_CANDIDATES = 6
 SIBLING_CONSENSUS_EVAL_RESERVED_CANDIDATES = 4
+EXPANDED_SURFACE_EVAL_RESERVED_CANDIDATES = 4
 COMBINED_MASK_REVIEW_AREA = 0.035
 SIBLING_CONSENSUS_MAX_REFERENCES = 4
 SIBLING_CONSENSUS_MIN_MATCHES = 70
@@ -920,6 +921,171 @@ def segmented_nearest_surface_repair(
         "segmented_surface_class_counts": class_counts,
         "segmented_surface_close_kernel": [close_w, close_h],
         "segmented_surface_background_kernel": surface_kernel,
+    }
+
+
+def expanded_glyph_local_median_surface_repair(
+    img: np.ndarray,
+    gray: np.ndarray,
+    mask: np.ndarray,
+    det: Detection,
+    *,
+    risky: bool,
+    protect_structural_edges: bool = False,
+) -> tuple[np.ndarray | None, np.ndarray | None, float, dict]:
+    """Rebuild a confirmed, possibly cropped watermark from local surfaces.
+
+    OCR sometimes returns only the middle of the Sunsky line. This operator
+    expands the canonical glyph footprint, never a rectangular band, and
+    replaces those glyph pixels with a local median surface estimate.
+    """
+    if mask is None or np.count_nonzero(mask) < 8:
+        return None, None, 0.0, {"reason": "empty_expanded_glyph_seed"}
+    confirmed = (
+        (
+            det.template.startswith("ocr:")
+            and det.ocr_watermark_score >= OCR_CROP_LOCALIZE_MIN
+        )
+        or det.confidence >= 0.92
+    )
+    if not confirmed:
+        return None, None, 0.0, {"reason": "expanded_glyph_detection_unconfirmed"}
+    if img.shape[:2] != gray.shape[:2] or not det.mark_box:
+        return None, None, 0.0, {"reason": "invalid_expanded_glyph_input"}
+
+    img_h, img_w = gray.shape[:2]
+    b = det.mark_box
+    canonical_width = int(round(float(b["h"]) * WATERMARK_CANONICAL_ASPECT))
+    desired_width = max(int(b["w"]), canonical_width)
+    desired_width = min(desired_width, int(round(float(b["w"]) * 1.65)))
+    cropped_ocr_box = desired_width > int(round(float(b["w"]) * 1.08))
+    extra_width = max(0, desired_width - int(b["w"]))
+    expanded_x = max(0, int(round(float(b["x"]) - extra_width / 2.0)))
+    desired_width = min(desired_width, img_w - expanded_x)
+    expanded_box = {
+        "x": expanded_x,
+        "y": max(0, int(b["y"])),
+        "w": max(24, desired_width),
+        "h": min(int(b["h"]), img_h - max(0, int(b["y"]))),
+    }
+
+    canonical = create_glyph_halo_mask(
+        canonical_ink_mask(),
+        expanded_box,
+        (8 if not risky else 6) if cropped_ocr_box else (5 if not risky else 3),
+        (3 if not risky else 2) if cropped_ocr_box else (2 if not risky else 1),
+        gray.shape,
+    )
+    seed = cv2.bitwise_or((mask > 0).astype(np.uint8) * 255, canonical)
+    repair_mask = cv2.morphologyEx(
+        seed,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)),
+        iterations=1,
+    )
+    repair_mask = cv2.dilate(
+        repair_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    if not cropped_ocr_box:
+        seed_support = cv2.dilate(
+            (mask > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 5)),
+            iterations=1,
+        )
+        repair_mask = cv2.bitwise_and(repair_mask, seed_support)
+
+    unprotected_pixels = int(np.count_nonzero(repair_mask))
+    protected_edge_pixels = 0
+    protected_coverage = 1.0
+    if protect_structural_edges:
+        pad_x = max(8, int(round(float(b["w"]) * 0.12)))
+        pad_y = max(6, int(round(float(b["h"]) * 0.45)))
+        x1, y1, x2, y2 = _expanded_mark_bounds(
+            gray.shape,
+            expanded_box,
+            pad_x,
+            pad_y,
+        )
+        edge_roi = cv2.Canny(gray[y1:y2, x1:x2], 55, 150)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(edge_roi, 8)
+        structural = np.zeros_like(edge_roi)
+        for idx in range(1, count):
+            _, _, width, height, component_area = stats[idx]
+            long_edge = (
+                width >= max(16, int(round(float(b["w"]) * 0.10)))
+                or height >= max(10, int(round(float(b["h"]) * 0.55)))
+            )
+            if component_area >= 8 and long_edge:
+                structural[labels == idx] = 255
+        structural = cv2.dilate(
+            structural,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        protected = np.zeros_like(gray, dtype=np.uint8)
+        protected[y1:y2, x1:x2] = structural
+        repair_mask = cv2.bitwise_and(repair_mask, cv2.bitwise_not(protected))
+        protected_edge_pixels = int(np.count_nonzero(protected))
+        protected_coverage = (
+            float(np.count_nonzero(repair_mask)) / max(1, unprotected_pixels)
+        )
+        if protected_coverage < 0.55:
+            return None, repair_mask, _mask_area(repair_mask), {
+                "reason": "expanded_glyph_edge_protection_too_broad",
+                "expanded_glyph_protected_coverage": protected_coverage,
+                "expanded_glyph_protected_edge_pixels": protected_edge_pixels,
+            }
+
+    area = _mask_area(repair_mask)
+    seed_area = _mask_area(mask)
+    area_limit = min(
+        0.10,
+        seed_area * (4.20 if risky else 4.80) + (0.006 if risky else 0.008),
+    )
+    ys, xs = np.where(repair_mask > 0)
+    if not len(xs) or not len(ys):
+        return None, repair_mask, area, {"reason": "empty_expanded_glyph_mask"}
+    bbox_area = (int(xs.max()) - int(xs.min()) + 1) * (int(ys.max()) - int(ys.min()) + 1)
+    fill_ratio = float(np.count_nonzero(repair_mask)) / max(1, bbox_area)
+    if area <= 0.0 or area > area_limit or fill_ratio > (0.68 if risky else 0.72):
+        return None, repair_mask, area, {
+            "reason": "expanded_glyph_mask_guard",
+            "expanded_glyph_area_pct": area * 100,
+            "expanded_glyph_area_limit_pct": area_limit * 100,
+            "expanded_glyph_fill_ratio": fill_ratio,
+        }
+
+    median_kernel = max(21, min(61, int(round(float(b["h"]) * 0.95)) | 1))
+    local_surface = cv2.medianBlur(img, median_kernel)
+    repaired = img.copy()
+    repaired[repair_mask > 0] = local_surface[repair_mask > 0]
+
+    # Keep the transition glyph-shaped while softening only its outermost
+    # pixels. No pixel outside repair_mask is modified.
+    eroded = cv2.erode(repair_mask, np.ones((3, 3), np.uint8), iterations=1)
+    boundary = (repair_mask > 0) & (eroded == 0)
+    if np.any(boundary):
+        blended = (
+            local_surface[boundary].astype(np.float32) * 0.78
+            + img[boundary].astype(np.float32) * 0.22
+        )
+        repaired[boundary] = np.uint8(np.clip(blended, 0, 255))
+
+    return repaired, repair_mask, area, {
+        "operator": "expanded_glyph_local_median_surface_repair",
+        "expanded_glyph_surface_candidate": True,
+        "expanded_glyph_surface_used": True,
+        "expanded_glyph_area_pct": area * 100,
+        "expanded_glyph_seed_area_pct": seed_area * 100,
+        "expanded_glyph_fill_ratio": fill_ratio,
+        "expanded_glyph_median_kernel": median_kernel,
+        "expanded_glyph_cropped_ocr_box": cropped_ocr_box,
+        "expanded_glyph_edge_protected": bool(protect_structural_edges),
+        "expanded_glyph_protected_coverage": protected_coverage,
+        "expanded_glyph_protected_edge_pixels": protected_edge_pixels,
+        "expanded_glyph_box": expanded_box,
     }
 
 
@@ -4230,6 +4396,26 @@ def candidate_failure_category(gate_meta: dict | None) -> str:
     return "candidate_failed_detection"
 
 
+def failed_candidate_review_score(
+    rank_score: float,
+    ocr_meta: dict,
+    dot_metrics: dict,
+    band_metrics: dict,
+    product_metrics: dict,
+) -> float:
+    """Score a failed candidate for review without strategy-specific bonuses."""
+    return (
+        max(0.0, -float(rank_score))
+        + float(dot_metrics.get("dot_chain_score") or 0.0) * 0.25
+        + float(band_metrics.get("visible_band_score") or 0.0) * 1.50
+        + float(product_metrics.get("product_blob_score") or 0.0) * 0.50
+        + (2.50 if product_metrics.get("product_gate_fail") else 0.0)
+        + (1.75 if band_metrics.get("band_gate_fail") else 0.0)
+        + (1.25 if ocr_meta.get("ocr_watermark") else 0.0)
+        + (0.35 if dot_metrics.get("dot_chain_fail") else 0.0)
+    )
+
+
 def final_blocker_type(gate_meta: dict | None) -> str:
     category = candidate_failure_category(gate_meta)
     return {
@@ -4734,6 +4920,34 @@ def clean_image(
         if first_mask is None:
             first_mask = mask
             first_area = area
+        if glyph:
+            for edge_protected, suffix, preference in (
+                (False, "", 0.50),
+                (True, "_edge_protected", 0.46),
+            ):
+                (
+                    expanded_candidate,
+                    expanded_mask,
+                    expanded_area,
+                    expanded_meta,
+                ) = expanded_glyph_local_median_surface_repair(
+                    img,
+                    gray,
+                    mask,
+                    det,
+                    risky=risky_product_roi,
+                    protect_structural_edges=edge_protected,
+                )
+                if expanded_candidate is not None and expanded_mask is not None:
+                    append_surface_candidate(
+                        expanded_candidate,
+                        expanded_mask,
+                        expanded_area,
+                        f"{variant}_expanded_glyph_local_median{suffix}",
+                        expanded_meta,
+                        area_weight=4.2 if risky_product_roi else 3.4,
+                        preference=preference,
+                    )
         area_limit = MAX_MASK_AREA if high_contrast_mask and not glyph else PILOT_MASK_AREA
         if area > area_limit:
             continue
@@ -4978,6 +5192,12 @@ def clean_image(
         if item[9].get("sibling_consensus_candidate")
     ][:SIBLING_CONSENSUS_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
+    for cand in [
+        item
+        for item in candidates
+        if item[9].get("expanded_glyph_surface_candidate")
+    ][:EXPANDED_SURFACE_EVAL_RESERVED_CANDIDATES]:
+        add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate") and "solved" in item[5]][:ALPHA_EVAL_RESERVED_CANDIDATES]:
         add_eval_candidate(cand)
     for cand in [item for item in candidates if item[9].get("alpha_candidate")][:ALPHA_EVAL_RESERVED_CANDIDATES]:
@@ -5030,27 +5250,23 @@ def clean_image(
             "alpha_template_residual_after": round(float(calpha_metrics.get("alpha_template_residual_after") or 0.0), 4),
             "reject_reasons": list(cgate_meta.get("reject_reasons") or []),
         })
-        failed_review_score = (
-            float(cmetrics["residual_score"])
-            + float(cmetrics["template_residual_score"]) * 0.35
-            + float(calpha_metrics.get("alpha_template_residual_after") or 0.0) * 0.55
-            + float(cdot_metrics.get("dot_chain_score") or 0.0) * 0.65
-            + float(cband_metrics.get("visible_band_score") or 0.0) * 1.50
-            + float(cproduct_metrics.get("product_blob_score") or 0.0) * 2.50
-            + (2.50 if cproduct_metrics.get("product_gate_fail") else 0.0)
-            + (1.75 if cband_metrics.get("band_gate_fail") else 0.0)
-            + (1.25 if cocr_meta.get("ocr_watermark") else 0.0)
-            + (0.75 if cdot_metrics.get("dot_chain_fail") else 0.0)
-            + carea * 3.0
+        # Candidate rank already combines the repair-family-appropriate fast
+        # residual, alpha, area, and sharpness evidence. Reuse that common
+        # scale for failed previews, then apply the expensive safety results.
+        # This avoids strategy-specific bonuses and prevents product texture
+        # counted as generic text components from hiding a visibly cleaner
+        # watermark-specific repair.
+        failed_review_score = failed_candidate_review_score(
+            cand[0],
+            cocr_meta,
+            cdot_metrics,
+            cband_metrics,
+            cproduct_metrics,
         )
-        if (
-            cextra.get("sibling_consensus_candidate")
-            and float(cextra.get("sibling_consensus_similarity") or 0.0) >= 0.70
-            and not cband_metrics.get("band_gate_fail")
-        ):
-            # This only chooses the most useful failed-QA preview. It does not
-            # change publish_ok or bypass the product-damage gate.
-            failed_review_score -= 0.90
+        candidate_traces[-1]["failed_review_score"] = round(
+            float(failed_review_score),
+            5,
+        )
         failed_eval = {
             "gray": cgray,
             "metrics": cmetrics,
@@ -5374,7 +5590,7 @@ def clean_image(
         "alpha_candidates_evaluated": alpha_candidates_evaluated,
         "best_alpha_after_over_all_candidates": round(float(best_alpha_after), 4),
         "best_candidate_id": selected_candidate_id,
-        "candidate_gate_trace": candidate_traces[:TOP_K_CANDIDATES],
+        "candidate_gate_trace": candidate_traces,
         "final_blocker_type": final_blocker_type(gate_meta),
         "alpha_engine_used": bool(selected_extra.get("alpha_engine_used")),
         "alpha_asset": str(SUNSKY_ALPHA_PATH.relative_to(PROJECT_ROOT)) if SUNSKY_ALPHA_PATH.exists() else "",
@@ -5420,6 +5636,28 @@ def clean_image(
         "segmented_surface_background_kernel": int(
             selected_extra.get("segmented_surface_background_kernel") or 0
         ),
+        "expanded_glyph_surface_used": bool(
+            selected_extra.get("expanded_glyph_surface_used")
+        ),
+        "expanded_glyph_area_pct": round(
+            float(selected_extra.get("expanded_glyph_area_pct") or 0.0),
+            3,
+        ),
+        "expanded_glyph_seed_area_pct": round(
+            float(selected_extra.get("expanded_glyph_seed_area_pct") or 0.0),
+            3,
+        ),
+        "expanded_glyph_fill_ratio": round(
+            float(selected_extra.get("expanded_glyph_fill_ratio") or 0.0),
+            4,
+        ),
+        "expanded_glyph_median_kernel": int(
+            selected_extra.get("expanded_glyph_median_kernel") or 0
+        ),
+        "expanded_glyph_cropped_ocr_box": bool(
+            selected_extra.get("expanded_glyph_cropped_ocr_box")
+        ),
+        "expanded_glyph_box": selected_extra.get("expanded_glyph_box") or {},
         "low_texture_plane_repair_used": bool(selected_extra.get("low_texture_plane_repair_used")),
         "plane_target_box": selected_extra.get("plane_target_box") or {},
         "plane_context_edge_density": round(
@@ -5717,6 +5955,63 @@ def clean_all_detections(
                 item.get("polarity_baseline_bbox")
                 for item in details
                 if item.get("polarity_baseline_bbox")
+            ),
+            {},
+        ),
+        "expanded_glyph_surface_used": any(
+            bool(item.get("expanded_glyph_surface_used"))
+            for item in details
+        ),
+        "expanded_glyph_area_pct": round(
+            max(
+                [
+                    float(item.get("expanded_glyph_area_pct") or 0.0)
+                    for item in details
+                    if isinstance(item.get("expanded_glyph_area_pct"), (int, float))
+                ],
+                default=0.0,
+            ),
+            3,
+        ),
+        "expanded_glyph_seed_area_pct": round(
+            max(
+                [
+                    float(item.get("expanded_glyph_seed_area_pct") or 0.0)
+                    for item in details
+                    if isinstance(item.get("expanded_glyph_seed_area_pct"), (int, float))
+                ],
+                default=0.0,
+            ),
+            3,
+        ),
+        "expanded_glyph_fill_ratio": round(
+            max(
+                [
+                    float(item.get("expanded_glyph_fill_ratio") or 0.0)
+                    for item in details
+                    if isinstance(item.get("expanded_glyph_fill_ratio"), (int, float))
+                ],
+                default=0.0,
+            ),
+            4,
+        ),
+        "expanded_glyph_median_kernel": max(
+            [
+                int(item.get("expanded_glyph_median_kernel") or 0)
+                for item in details
+                if isinstance(item.get("expanded_glyph_median_kernel"), int)
+            ],
+            default=0,
+        ),
+        "expanded_glyph_cropped_ocr_box": any(
+            bool(item.get("expanded_glyph_cropped_ocr_box"))
+            for item in details
+        ),
+        "expanded_glyph_box": next(
+            (
+                item.get("expanded_glyph_box")
+                for item in details
+                if item.get("expanded_glyph_box")
             ),
             {},
         ),
